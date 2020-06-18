@@ -4,6 +4,7 @@ import re
 import six
 import math
 import lmdb
+import random
 import torch
 
 from natsort import natsorted
@@ -13,6 +14,7 @@ from torch.utils.data import Dataset, ConcatDataset, Subset
 from torch._utils import _accumulate
 import torchvision.transforms as transforms
 
+import pdb
 
 class Batch_Balanced_Dataset(object):
 
@@ -22,7 +24,7 @@ class Batch_Balanced_Dataset(object):
         For example, when select_data is "MJ-ST" and batch_ratio is "0.5-0.5",
         the 50% of the batch is filled with MJ and the other 50% of the batch is filled with ST.
         """
-        log = open(f'./saved_models/{opt.exp_name}/log_dataset.txt', 'a')
+        log = open(os.path.join(opt.exp_dir,opt.exp_name,'log_dataset.txt'), 'a')
         dashed_line = '-' * 80
         print(dashed_line)
         log.write(dashed_line + '\n')
@@ -77,8 +79,21 @@ class Batch_Balanced_Dataset(object):
         print(Total_batch_size_log)
         log.write(Total_batch_size_log + '\n')
         log.close()
+        
+        self.pairText = opt.pairText
+        self.lexicons=[]
+        out_of_char = f'[^{opt.character}]'
+        if opt.pairText == True:
+            #read lexicons file
+            with open(opt.lexFile,'r') as lexF:
+                for line in lexF:
+                    lexWord = line[:-1]
+                    if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())):
+                        self.lexicons.append(lexWord)
+            
 
     def get_batch(self):
+        
         balanced_batch_images = []
         balanced_batch_texts = []
 
@@ -97,7 +112,10 @@ class Batch_Balanced_Dataset(object):
 
         balanced_batch_images = torch.cat(balanced_batch_images, 0)
 
-        return balanced_batch_images, balanced_batch_texts
+        if self.pairText:
+            return balanced_batch_images, balanced_batch_texts, random.sample(self.lexicons,len(balanced_batch_texts))
+        else:
+            return balanced_batch_images, balanced_batch_texts
 
 
 def hierarchical_dataset(root, opt, select_data='/'):

@@ -1,6 +1,8 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
+import pdb
+
 
 class VGG_FeatureExtractor(nn.Module):
     """ FeatureExtractor of CRNN (https://arxiv.org/pdf/1507.05717.pdf) """
@@ -22,7 +24,8 @@ class VGG_FeatureExtractor(nn.Module):
             nn.Conv2d(self.output_channel[3], self.output_channel[3], 3, 1, 1, bias=False),
             nn.BatchNorm2d(self.output_channel[3]), nn.ReLU(True),
             nn.MaxPool2d((2, 1), (2, 1)),  # 512x2x25
-            nn.Conv2d(self.output_channel[3], self.output_channel[3], 2, 1, 0), nn.ReLU(True))  # 512x1x24
+            #p# nn.Conv2d(self.output_channel[3], self.output_channel[3], 2, 1, 0), nn.ReLU(True))  # 512x1x24
+            nn.Conv2d(self.output_channel[3], self.output_channel[3], 3, 1, 1), nn.ReLU(True))  # 512x1x24
 
     def forward(self, input):
         return self.ConvNet(input)
