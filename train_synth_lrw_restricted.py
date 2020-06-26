@@ -4,7 +4,6 @@ import time
 import random
 import string
 import argparse
-import faulthandler; faulthandler.enable()
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -12,17 +11,27 @@ import torch.nn.init as init
 import torch.optim as optim
 import torch.utils.data
 import numpy as np
- 
+
 import pdb
 
 from utils import CTCLabelConverter, AttnLabelConverter, Averager
 from dataset import hierarchical_dataset, AlignCollate, Batch_Balanced_Dataset, tensor2im, save_image
-from model import Model, AdaINGen
-from test_synth import validation, validation_synth
+from model import Model, AdaINGen, MsImageDis
+from test_synth import validation, validation_synth, validation_synth_adv, validation_synth_lrw, validation_synth_lrw_res
+
+import tflib as lib
+import tflib.plot
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def train(opt):
+    plotDir = os.path.join(opt.exp_dir,opt.exp_name,'plots')
+    if not os.path.exists(plotDir):
+        os.makedirs(plotDir)
+    
+    lib.print_model_settings(locals().copy())
+
     """ dataset preparation """
     if not opt.data_filtering_off:
         print('Filtering the images containing characters which are not in opt.character')
@@ -31,6 +40,10 @@ def train(opt):
 
     opt.select_data = opt.select_data.split('-')
     opt.batch_ratio = opt.batch_ratio.split('-')
+
+    #considering the real images for discriminator
+    opt.batch_size = opt.batch_size*2
+
     train_dataset = Batch_Balanced_Dataset(opt)
 
     log = open(os.path.join(opt.exp_dir,opt.exp_name,'log_dataset.txt'), 'a')
@@ -58,47 +71,50 @@ def train(opt):
     
     model = AdaINGen(opt)
     ocrModel = Model(opt)
+    disModel = MsImageDis(opt)
     
     print('model input parameters', opt.imgH, opt.imgW, opt.num_fiducial, opt.input_channel, opt.output_channel,
           opt.hidden_size, opt.num_class, opt.batch_max_length, opt.Transformation, opt.FeatureExtraction,
           opt.SequenceModeling, opt.Prediction)
 
-    # Synthesizer weight initialization
-    for name, param in model.named_parameters():
-        if 'localization_fc2' in name:
-            print(f'Skip {name} as it is already initialized')
-            continue
-        try:
-            if 'bias' in name:
-                init.constant_(param, 0.0)
-            elif 'weight' in name:
-                init.kaiming_normal_(param)
-        except Exception as e:  # for batchnorm.
-            if 'weight' in name:
-                param.data.fill_(1)
-            continue
     
-    # Recognizer weight initialization
-    for name, param in ocrModel.named_parameters():
-        if 'localization_fc2' in name:
-            print(f'Skip {name} as it is already initialized')
-            continue
-        try:
-            if 'bias' in name:
-                init.constant_(param, 0.0)
-            elif 'weight' in name:
-                init.kaiming_normal_(param)
-        except Exception as e:  # for batchnorm.
-            if 'weight' in name:
-                param.data.fill_(1)
-            continue
-
+    #  weight initialization
+    for currModel in [model, ocrModel, disModel]:
+        for name, param in currModel.named_parameters():
+            if 'localization_fc2' in name:
+                print(f'Skip {name} as it is already initialized')
+                continue
+            try:
+                if 'bias' in name:
+                    init.constant_(param, 0.0)
+                elif 'weight' in name:
+                    init.kaiming_normal_(param)
+            except Exception as e:  # for batchnorm.
+                if 'weight' in name:
+                    param.data.fill_(1)
+                continue
+    
+    
     # data parallel for multi-GPU
+    ocrModel = torch.nn.DataParallel(ocrModel).to(device)
+    if not opt.ocrFixed:
+        ocrModel.train()
+
     model = torch.nn.DataParallel(model).to(device)
     model.train()
+    
+    disModel = torch.nn.DataParallel(disModel).to(device)
+    disModel.train()
 
-    ocrModel = torch.nn.DataParallel(ocrModel).to(device)
-    ocrModel.train()
+    #loading pre-trained model
+    if opt.saved_ocr_model != '':
+        print(f'loading pretrained ocr model from {opt.saved_ocr_model}')
+        if opt.FT:
+            ocrModel.load_state_dict(torch.load(opt.saved_ocr_model), strict=False)
+        else:
+            ocrModel.load_state_dict(torch.load(opt.saved_ocr_model))
+    print("OCRModel:")
+    print(ocrModel)
 
     if opt.saved_synth_model != '':
         print(f'loading pretrained synth model from {opt.saved_synth_model}')
@@ -106,18 +122,17 @@ def train(opt):
             model.load_state_dict(torch.load(opt.saved_synth_model), strict=False)
         else:
             model.load_state_dict(torch.load(opt.saved_synth_model))
-    print("Model:")
+    print("SynthModel:")
     print(model)
 
-    if opt.saved_ocr_model != '':
-        print(f'loading pretrained ocr model from {opt.saved_ocr_model}')
+    if opt.saved_dis_model != '':
+        print(f'loading pretrained discriminator model from {opt.saved_dis_model}')
         if opt.FT:
-            ocrModel.load_state_dict(torch.load(opt.saved_ocr_model), strict=False)
+            disModel.load_state_dict(torch.load(opt.saved_dis_model), strict=False)
         else:
-            ocrModel.load_state_dict(torch.load(opt.saved_ocr_model))
-    # ocrModel.eval()   #as we can't call RNN.backward in eval mode
-    print("OCRModel:")
-    print(ocrModel)
+            disModel.load_state_dict(torch.load(opt.saved_dis_model))
+    print("DisModel:")
+    print(disModel)
 
     """ setup loss """
     if 'CTC' in opt.Prediction:
@@ -126,11 +141,14 @@ def train(opt):
         ocrCriterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)  # ignore [GO] token = ignore index 0
     
     recCriterion = torch.nn.L1Loss()
+    styleRecCriterion = torch.nn.L1Loss()
 
     # loss averager
+    loss_avg_ocr = Averager()
     loss_avg = Averager()
-    loss_avg_ocr = Averager() ##----------
+    loss_avg_dis = Averager()
 
+    ##---------------------------------------##
     # filter that only require gradient decent
     filtered_parameters = []
     params_num = []
@@ -149,7 +167,6 @@ def train(opt):
     print(optimizer)
 
     #filter parameters for OCR training
-    # filter that only require gradient decent
     ocr_filtered_parameters = []
     ocr_params_num = []
     for p in filter(lambda p: p.requires_grad, ocrModel.parameters()):
@@ -166,10 +183,24 @@ def train(opt):
     print("OCROptimizer:")
     print(ocr_optimizer)
 
+    #filter parameters for OCR training
+    dis_filtered_parameters = []
+    dis_params_num = []
+    for p in filter(lambda p: p.requires_grad, disModel.parameters()):
+        dis_filtered_parameters.append(p)
+        dis_params_num.append(np.prod(p.size()))
+    print('Dis Trainable params num : ', sum(dis_params_num))
 
+    # setup optimizer
+    if opt.adam:
+        dis_optimizer = optim.Adam(dis_filtered_parameters, lr=opt.lr, betas=(opt.beta1, 0.999))
+    else:
+        dis_optimizer = optim.Adadelta(dis_filtered_parameters, lr=opt.lr, rho=opt.rho, eps=opt.eps)
+    print("DisOptimizer:")
+    print(dis_optimizer)
+    ##---------------------------------------##
 
     """ final options """
-    # print(opt)
     with open(os.path.join(opt.exp_dir,opt.exp_name,'opt.txt'), 'a') as opt_file:
         opt_log = '------------ Options -------------\n'
         args = vars(opt)
@@ -194,38 +225,68 @@ def train(opt):
     best_accuracy_ocr = -1
     best_norm_ED_ocr = -1
     iteration = start_iter
-    cntr=1
+    # cntr=0
     while(True):
         # train part
         
-        image_tensors, labels_1, labels_2 = train_dataset.get_batch()
-
+        image_tensors_all, labels_1_all, labels_2_all = train_dataset.get_batch()
+        
         # ## comment
         # pdb.set_trace()
         # for imgCntr in range(image_tensors.shape[0]):
         #     save_image(tensor2im(image_tensors[imgCntr]),'temp/'+str(imgCntr)+'.png')
         # pdb.set_trace()
         # ###
+        # print(cntr)
+        # cntr+=1
+        disCnt = int(image_tensors_all.size(0)/2)
+        image_tensors, image_tensors_real, labels_1, labels_2 = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt], labels_2_all[:disCnt]
+
         image = image_tensors.to(device)
+        image_real = image_tensors_real.to(device)
+        batch_size = image.size(0)
+
+        
+        ##-----------------------------------##
+        #generate text(labels) from ocr.forward
+        if opt.ocrFixed:
+            length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+            text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+            
+            if 'CTC' in opt.Prediction:
+                preds = ocrModel(image, text_for_pred)
+                preds = preds[:, :text_for_loss.shape[1] - 1, :]
+                preds_size = torch.IntTensor([preds.size(1)] * batch_size)
+                _, preds_index = preds.max(2)
+                labels_1 = converter.decode(preds_index.data, preds_size.data)
+            else:
+                preds = ocrModel(image, text_for_pred, is_train=False)
+                _, preds_index = preds.max(2)
+                labels_1 = converter.decode(preds_index, length_for_pred)
+                for idx, pred in enumerate(labels_1):
+                    pred_EOS = pred.find('[s]')
+                    labels_1[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+
+        ##-----------------------------------##
+
         text_1, length_1 = converter.encode(labels_1, batch_max_length=opt.batch_max_length)
         text_2, length_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
-        batch_size = image.size(0)
-        # pdb.set_trace()
-        # print(cntr,image.shape)
-        cntr+=1
-        images_recon_1, images_recon_2 = model(image, text_1, text_2)
         
+        #forward pass from style and word generator
+        
+        images_recon_1, images_recon_2, style = model(image, text_1, text_2)
 
         if 'CTC' in opt.Prediction:
             
-            #ocr training
-            preds_ocr = ocrModel(image, text_1)
-            preds_size_ocr = torch.IntTensor([preds_ocr.size(1)] * batch_size)
-            preds_ocr = preds_ocr.log_softmax(2).permute(1, 0, 2)
+            if not opt.ocrFixed:
+                #ocr training with orig image
+                preds_ocr = ocrModel(image, text_1)
+                preds_size_ocr = torch.IntTensor([preds_ocr.size(1)] * batch_size)
+                preds_ocr = preds_ocr.log_softmax(2).permute(1, 0, 2)
 
-            ocrCost_train = ocrCriterion(preds_ocr, text_1, preds_size_ocr, length_1)
-
-            #synth training
+                ocrCost_train = ocrCriterion(preds_ocr, text_1, preds_size_ocr, length_1)
+  
+            #content loss for reconstructed images
             preds_1 = ocrModel(images_recon_1, text_1)
             preds_size_1 = torch.IntTensor([preds_1.size(1)] * batch_size)
             preds_1 = preds_1.log_softmax(2).permute(1, 0, 2)
@@ -234,38 +295,66 @@ def train(opt):
             preds_size_2 = torch.IntTensor([preds_2.size(1)] * batch_size)
             preds_2 = preds_2.log_softmax(2).permute(1, 0, 2)
 
-            ocrCost = ocrCriterion(preds_1, text_1, preds_size_1, length_1) + ocrCriterion(preds_2, text_2, preds_size_2, length_2)
+            ocrCost = 0.5*(ocrCriterion(preds_1, text_1, preds_size_1, length_1) + ocrCriterion(preds_2, text_2, preds_size_2, length_2))
 
         else:
-            preds = model(image, text[:, :-1])  # align with Attention.forward
-            target = text[:, 1:]  # without [GO] Symbol
-            ocrCost = ocrCriterion(preds.view(-1, preds.shape[-1]), target.contiguous().view(-1))
+            if not opt.ocrFixed:
+                #ocr training with orig image
+                preds_ocr = ocrModel(image, text_1[:, :-1])  # align with Attention.forward
+                target_ocr = text_1[:, 1:]  # without [GO] Symbol
 
-        # pdb.set_trace()
+                ocrCost_train = ocrCriterion(preds_ocr.view(-1, preds_ocr.shape[-1]), target_ocr.contiguous().view(-1))
+
+            #content loss for reconstructed images
+            preds_1 = ocrModel(images_recon_1, text_1[:, :-1])  # align with Attention.forward
+            target_1 = text_1[:, 1:]  # without [GO] Symbol
+
+            preds_2 = ocrModel(images_recon_2, text_2[:, :-1])  # align with Attention.forward
+            target_2 = text_2[:, 1:]  # without [GO] Symbol
+
+            ocrCost = 0.5*(ocrCriterion(preds_1.view(-1, preds_1.shape[-1]), target_1.contiguous().view(-1))+ocrCriterion(preds_2.view(-1, preds_2.shape[-1]), target_2.contiguous().view(-1)))
+        
+        if not opt.ocrFixed:
+            #training OCR
+            ocrModel.zero_grad()
+            ocrCost_train.backward()
+            torch.nn.utils.clip_grad_norm_(ocrModel.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
+            ocr_optimizer.step()
+            #if ocr is fixed; ignore this loss
+            loss_avg_ocr.add(ocrCost_train)
+        else:
+            loss_avg_ocr.add(torch.tensor(0.0))
+
+        
+        #Domain discriminator: Dis update
+        disCost = opt.disWeight*0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
+        disModel.zero_grad()
+        disCost.backward()
+        torch.nn.utils.clip_grad_norm_(disModel.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
+        dis_optimizer.step()
+        loss_avg_dis.add(disCost)
+        
+        #[Style Encoder] + [Word Generator] update
+        #Adversarial loss
+        disGenCost = 0.5*(disModel.module.calc_gen_loss(images_recon_1)+disModel.module.calc_gen_loss(images_recon_2))
+
+        #Input reconstruction loss
         recCost = recCriterion(images_recon_1,image)
 
-        cost = ocrCost + recCost
+        #Pair style reconstruction loss
+        styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style)
+
+        cost = opt.ocrWeight*ocrCost + opt.reconWeight*recCost + opt.disWeight*disGenCost + opt.styleReconWeight*styleRecCost
 
         model.zero_grad()
         ocrModel.zero_grad()
+        disModel.zero_grad()
         cost.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
         optimizer.step()
-
         loss_avg.add(cost)
 
-        #training OCR
-        
-        ocrModel.zero_grad()
-        # print(ocrCost_train, labels_1)
-        ocrCost_train.backward()
-        torch.nn.utils.clip_grad_norm_(ocrModel.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
-        ocr_optimizer.step()
-        
 
-        loss_avg_ocr.add(ocrCost_train)
-        # pdb.set_trace()
-        
         # validation part
         if (iteration + 1) % opt.valInterval == 0 or iteration == 0: # To see training progress, we also conduct validation when 'iteration == 0' 
             
@@ -281,43 +370,62 @@ def train(opt):
             
             elapsed_time = time.time() - start_time
             # for log
+            
             with open(os.path.join(opt.exp_dir,opt.exp_name,'log_train.txt'), 'a') as log:
                 model.eval()
                 ocrModel.eval()
-                with torch.no_grad():
-                    # valid_loss, current_accuracy, current_norm_ED, preds, confidence_score, labels, infer_time, length_of_data = validation(
-                    #     model, criterion, valid_loader, converter, opt)
-                    
-                    valid_loss, current_accuracy, current_norm_ED, preds, confidence_score, labels, infer_time, length_of_data = validation_synth(
-                        iteration, model, ocrModel, recCriterion, ocrCriterion, valid_loader, converter, opt)
+                disModel.eval()
+                
+                with torch.no_grad():                    
+                    valid_loss, current_accuracy, current_norm_ED, preds, confidence_score, labels, infer_time, length_of_data = validation_synth_lrw_res(
+                        iteration, model, ocrModel, disModel, recCriterion, styleRecCriterion, ocrCriterion, valid_loader, converter, opt)
                 model.train()
                 ocrModel.train()
+                disModel.train()
 
                 # training loss and validation loss
-                loss_log = f'[{iteration+1}/{opt.num_iter}] Train OCR loss: {loss_avg_ocr.val():0.5f}, Train Synth loss: {loss_avg.val():0.5f}, Valid OCR loss: {valid_loss[0]:0.5f}, Valid Synth loss: {valid_loss[1]:0.5f}, Elapsed_time: {elapsed_time:0.5f}'
-                loss_avg_ocr.reset()
-                loss_avg.reset()
+                loss_log = f'[{iteration+1}/{opt.num_iter}] Train OCR loss: {loss_avg_ocr.val():0.5f}, Train Synth loss: {loss_avg.val():0.5f}, Train Dis loss: {loss_avg_dis.val():0.5f}, Valid OCR loss: {valid_loss[0]:0.5f}, Valid Synth loss: {valid_loss[1]:0.5f}, Valid Dis loss: {valid_loss[2]:0.5f}, Elapsed_time: {elapsed_time:0.5f}'
+                
 
                 current_model_log_ocr = f'{"Current_accuracy_OCR":17s}: {current_accuracy[0]:0.3f}, {"Current_norm_ED_OCR":17s}: {current_norm_ED[0]:0.2f}'
                 current_model_log_1 = f'{"Current_accuracy_recon":17s}: {current_accuracy[1]:0.3f}, {"Current_norm_ED_recon":17s}: {current_norm_ED[1]:0.2f}'
                 current_model_log_2 = f'{"Current_accuracy_pair":17s}: {current_accuracy[2]:0.3f}, {"Current_norm_ED_pair":17s}: {current_norm_ED[2]:0.2f}'
                 
+                #plotting
+                # pdb.set_trace()
+                lib.plot.plot(os.path.join(plotDir,'Train-OCR-Loss'), loss_avg_ocr.val().item())
+                lib.plot.plot(os.path.join(plotDir,'Train-Synth-Loss'), loss_avg.val().item())
+                lib.plot.plot(os.path.join(plotDir,'Train-Dis-Loss'), loss_avg_dis.val().item())
+                lib.plot.plot(os.path.join(plotDir,'Valid-OCR-Loss'), valid_loss[0].item())
+                lib.plot.plot(os.path.join(plotDir,'Valid-Synth-Loss'), valid_loss[1].item())
+                lib.plot.plot(os.path.join(plotDir,'Valid-Dis-Loss'), valid_loss[2].item())
+
+                lib.plot.plot(os.path.join(plotDir,'Orig-OCR-WordAccuracy'), current_accuracy[0])
+                lib.plot.plot(os.path.join(plotDir,'Recon-OCR-WordAccuracy'), current_accuracy[1])
+                lib.plot.plot(os.path.join(plotDir,'Pair-OCR-WordAccuracy'), current_accuracy[2])
+                
+
                 # keep best accuracy model (on valid dataset)
                 if current_accuracy[1] > best_accuracy:
                     best_accuracy = current_accuracy[1]
                     torch.save(model.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'best_accuracy.pth'))
+                    torch.save(disModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'best_accuracy_dis.pth'))
                 if current_norm_ED[1] > best_norm_ED:
                     best_norm_ED = current_norm_ED[1]
                     torch.save(model.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'best_norm_ED.pth'))
+                    torch.save(disModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'best_norm_ED_dis.pth'))
                 best_model_log = f'{"Best_accuracy_Recon":17s}: {best_accuracy:0.3f}, {"Best_norm_ED_Recon":17s}: {best_norm_ED:0.2f}'
 
                 # keep best accuracy model (on valid dataset)
+                # if not opt.ocrFixed:
                 if current_accuracy[0] > best_accuracy_ocr:
                     best_accuracy_ocr = current_accuracy[0]
-                    torch.save(ocrModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'best_accuracy_ocr.pth'))
+                    if not opt.ocrFixed:
+                        torch.save(ocrModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'best_accuracy_ocr.pth'))
                 if current_norm_ED[0] > best_norm_ED_ocr:
                     best_norm_ED_ocr = current_norm_ED[0]
-                    torch.save(ocrModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'best_norm_ED_ocr.pth'))
+                    if not opt.ocrFixed:
+                        torch.save(ocrModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'best_norm_ED_ocr.pth'))
                 best_model_log_ocr = f'{"Best_accuracy_ocr":17s}: {best_accuracy_ocr:0.3f}, {"Best_norm_ED_ocr":17s}: {best_norm_ED_ocr:0.2f}'
 
                 loss_model_log = f'{loss_log}\n{current_model_log_ocr}\n{current_model_log_1}\n{current_model_log_2}\n{best_model_log_ocr}\n{best_model_log}'
@@ -328,10 +436,17 @@ def train(opt):
                 dashed_line = '-' * 80
                 head = f'{"Ground Truth":32s} | {"Prediction":25s} | Confidence Score & T/F'
                 predicted_result_log = f'{dashed_line}\n{head}\n{dashed_line}\n'
+                
                 for gt_ocr, pred_ocr, confidence_ocr, gt_1, pred_1, confidence_1, gt_2, pred_2, confidence_2 in zip(labels[0][:5], preds[0][:5], confidence_score[0][:5], labels[1][:5], preds[1][:5], confidence_score[1][:5], labels[2][:5], preds[2][:5], confidence_score[2][:5]):
                     if 'Attn' in opt.Prediction:
-                        gt = gt[:gt.find('[s]')]
-                        pred = pred[:pred.find('[s]')]
+                        # gt_ocr = gt_ocr[:gt_ocr.find('[s]')]
+                        pred_ocr = pred_ocr[:pred_ocr.find('[s]')]
+
+                        # gt_1 = gt_1[:gt_1.find('[s]')]
+                        pred_1 = pred_1[:pred_1.find('[s]')]
+
+                        # gt_2 = gt_2[:gt_2.find('[s]')]
+                        pred_2 = pred_2[:pred_2.find('[s]')]
 
                     predicted_result_log += f'{"ocr"}: {gt_ocr:27s} | {pred_ocr:25s} | {confidence_ocr:0.4f}\t{str(pred_ocr == gt_ocr)}\n'
                     predicted_result_log += f'{"recon"}: {gt_1:25s} | {pred_1:25s} | {confidence_1:0.4f}\t{str(pred_1 == gt_1)}\n'
@@ -339,14 +454,24 @@ def train(opt):
                 predicted_result_log += f'{dashed_line}'
                 print(predicted_result_log)
                 log.write(predicted_result_log + '\n')
-            
+
+                loss_avg_ocr.reset()
+                loss_avg.reset()
+                loss_avg_dis.reset()
+
+            lib.plot.flush()
+
+        lib.plot.tick()
 
         # save model per 1e+5 iter.
         if (iteration + 1) % 1e+5 == 0:
             torch.save(
                 model.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_{iteration+1}.pth'))
+            if not opt.ocrFixed:
+                torch.save(
+                    ocrModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_{iteration+1}_ocr.pth'))
             torch.save(
-                ocrModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_{iteration+1}_ocr.pth'))
+                disModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_{iteration+1}_dis.pth'))
 
         if (iteration + 1) == opt.num_iter:
             print('end the training')
@@ -367,6 +492,7 @@ if __name__ == '__main__':
     parser.add_argument('--valInterval', type=int, default=2000, help='Interval between each validation')
     parser.add_argument('--saved_ocr_model', default='', help="path to model to continue training")
     parser.add_argument('--saved_synth_model', default='', help="path to model to continue training")
+    parser.add_argument('--saved_dis_model', default='', help="path to model to continue training")
     parser.add_argument('--FT', action='store_true', help='whether to do fine-tuning')
     parser.add_argument('--adam', action='store_true', help='Whether to use adam (default is Adadelta)')
     parser.add_argument('--lr', type=float, default=1, help='learning rate, default=1.0 for Adadelta')
@@ -405,6 +531,12 @@ if __name__ == '__main__':
                         help='the number of output channel of Feature extractor')
     parser.add_argument('--hidden_size', type=int, default=256, help='the size of the LSTM hidden state')
     parser.add_argument('--char_embed_size', type=int, default=60, help='character embedding for content encoder')
+    parser.add_argument('--ocrFixed', action='store_true', help='true: for pretrined OCR and fixed weights')
+    parser.add_argument('--ocrWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--reconWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--disWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--styleReconWeight', type=float, default=1.0, help='weights for loss')
+
 
     parser.add_argument('--debugFlag', action='store_true', help='for debugging')
 

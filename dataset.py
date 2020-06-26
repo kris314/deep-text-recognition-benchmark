@@ -100,6 +100,7 @@ class Batch_Balanced_Dataset(object):
         for i, data_loader_iter in enumerate(self.dataloader_iter_list):
             try:
                 image, text = data_loader_iter.next()
+                
                 balanced_batch_images.append(image)
                 balanced_batch_texts += text
             except StopIteration:
@@ -202,7 +203,10 @@ class LmdbDataset(Dataset):
 
         with self.env.begin(write=False) as txn:
             label_key = 'label-%09d'.encode() % index
+            
             label = txn.get(label_key).decode('utf-8')
+            
+            
             img_key = 'image-%09d'.encode() % index
             imgbuf = txn.get(img_key)
 
@@ -299,9 +303,11 @@ class NormalizePAD(object):
         c, h, w = img.size()
         Pad_img = torch.FloatTensor(*self.max_size).fill_(0)
         Pad_img[:, :, :w] = img  # right pad
+        
         if self.max_size[2] != w:  # add border Pad
-            Pad_img[:, :, w:] = img[:, :, w - 1].unsqueeze(2).expand(c, h, self.max_size[2] - w)
-
+            # Pad_img[:, :, w:] = img[:, :, w - 1].unsqueeze(2).expand(c, h, self.max_size[2] - w)
+            zero_vec = torch.zeros((img.size()[0],img.size()[1]))
+            Pad_img[:, :, w:] = zero_vec.unsqueeze(2).expand(c, h, self.max_size[2] - w)
         return Pad_img
 
 

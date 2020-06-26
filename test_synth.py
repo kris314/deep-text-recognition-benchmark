@@ -181,6 +181,9 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
     """ validation or evaluation """
     os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
 
+    n_correct_ocr = 0
+    norm_ED_ocr = 0
+
     n_correct_1 = 0
     norm_ED_1 = 0
     n_correct_2 = 0
@@ -188,6 +191,7 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
 
     length_of_data = 0
     infer_time = 0
+    valid_loss_avg_ocr = Averager()
     valid_loss_avg = Averager()
 
     lexicons=[]
@@ -200,8 +204,8 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
                 lexicons.append(lexWord)
 
     for i, (image_tensors, labels_1) in enumerate(evaluation_loader):
-        print(i)
-        if opt.debugFlag and i>1:
+        # print(i)
+        if opt.debugFlag and i>2:
             break
 
         batch_size = image_tensors.size(0)
@@ -219,16 +223,20 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
         text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
         
         start_time = time.time()
-        images_recon_1, images_recon_2 = synthModel(image, text_for_loss_1, text_for_loss_2)
+        images_recon_1, images_recon_2,_ = synthModel(image, text_for_loss_1, text_for_loss_2)
 
         #Save random reconstructed image and write its gt
-        rIdx = random.randint(0,batch_size)
-        save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+labels_1[rIdx]+'_1.png'))
-        save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+labels_2[rIdx]+'_2.png'))
+        rIdx = random.randint(0,batch_size-1)
+        try:
+            save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_input_'+labels_1[rIdx]+'.png'))
+            save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_recon_'+labels_1[rIdx]+'.png'))
+            save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_pair_'+labels_2[rIdx]+'.png'))
+        except:
+            print('Warning while saving validation image')
         
-
         
         if 'CTC' in opt.Prediction:
+            preds_ocr = ocrModel(image, text_for_pred)
             preds_1 = ocrModel(images_recon_1, text_for_pred)
             preds_2 = ocrModel(images_recon_2, text_for_pred)
 
@@ -239,12 +247,15 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
             preds_size_2 = torch.IntTensor([preds_2.size(1)] * batch_size)
 
             # permute 'preds' to use CTCloss format
+            ocrCost_ocr = ocrCriterion(preds_ocr.log_softmax(2).permute(1, 0, 2), text_for_loss_1, preds_size_1, length_for_loss_1)
             ocrCost_1 = ocrCriterion(preds_1.log_softmax(2).permute(1, 0, 2), text_for_loss_1, preds_size_1, length_for_loss_1)
             ocrCost_2 = ocrCriterion(preds_2.log_softmax(2).permute(1, 0, 2), text_for_loss_2, preds_size_2, length_for_loss_2)
 
             # Select max probabilty (greedy decoding) then decode index to character
+            _, preds_index_ocr = preds_ocr.max(2)
             _, preds_index_1 = preds_1.max(2)
             _, preds_index_2 = preds_2.max(2)
+            preds_str_ocr = converter.decode(preds_index_ocr.data, preds_size_1.data)
             preds_str_1 = converter.decode(preds_index_1.data, preds_size_1.data)
             preds_str_2 = converter.decode(preds_index_2.data, preds_size_2.data)
         
@@ -265,18 +276,23 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
         recCost = recCriterion(images_recon_1,image)
 
         infer_time += forward_time
+        valid_loss_avg_ocr.add(ocrCost_ocr)
         valid_loss_avg.add(ocrCost_1+ocrCost_2+recCost)
 
         # calculate accuracy & confidence score
+        preds_prob_ocr = F.softmax(preds_ocr, dim=2)
+        preds_max_prob_ocr, _ = preds_prob_ocr.max(dim=2)
+
         preds_prob_1 = F.softmax(preds_1, dim=2)
         preds_max_prob_1, _ = preds_prob_1.max(dim=2)
 
         preds_prob_2 = F.softmax(preds_2, dim=2)
         preds_max_prob_2, _ = preds_prob_2.max(dim=2)
 
+        confidence_score_list_ocr = []
         confidence_score_list_1 = []
         confidence_score_list_2 = []
-        for gt_1, pred_1, pred_max_prob_1, gt_2, pred_2, pred_max_prob_2 in zip(labels_1, preds_str_1, preds_max_prob_1, labels_2, preds_str_2, preds_max_prob_2):
+        for gt_ocr, pred_ocr, pred_max_prob_ocr, gt_1, pred_1, pred_max_prob_1, gt_2, pred_2, pred_max_prob_2 in zip(labels_1, preds_str_ocr, preds_max_prob_ocr, labels_1, preds_str_1, preds_max_prob_1, labels_2, preds_str_2, preds_max_prob_2):
             if 'Attn' in opt.Prediction:
                 gt = gt[:gt.find('[s]')]
                 pred_EOS = pred.find('[s]')
@@ -291,6 +307,9 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
                 out_of_alphanumeric_case_insensitve = f'[^{alphanumeric_case_insensitve}]'
                 pred = re.sub(out_of_alphanumeric_case_insensitve, '', pred)
                 gt = re.sub(out_of_alphanumeric_case_insensitve, '', gt)
+
+            if pred_ocr == gt_ocr:
+                n_correct_ocr += 1
 
             if pred_1 == gt_1:
                 n_correct_1 += 1
@@ -322,17 +341,31 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
                 norm_ED_2 += 1 - edit_distance(pred_2, gt_2) / len(gt_2)
             else:
                 norm_ED_2 += 1 - edit_distance(pred_2, gt_2) / len(pred_2)
+            
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_ocr) == 0 or len(pred_ocr) == 0:
+                norm_ED_ocr += 0
+            elif len(gt_ocr) > len(pred_ocr):
+                norm_ED_ocr += 1 - edit_distance(pred_ocr, gt_ocr) / len(gt_ocr)
+            else:
+                norm_ED_ocr += 1 - edit_distance(pred_ocr, gt_ocr) / len(pred_ocr)
 
             # calculate confidence score (= multiply of pred_max_prob)
             try:
+                confidence_score_ocr = pred_max_prob_ocr.cumprod(dim=0)[-1]
                 confidence_score_1 = pred_max_prob_1.cumprod(dim=0)[-1]
                 confidence_score_2 = pred_max_prob_2.cumprod(dim=0)[-1]
             except:
+                confidence_score_ocr = 0
                 confidence_score_1 = 0  # for empty pred case, when prune after "end of sentence" token ([s])
                 confidence_score_2 = 0  # for empty pred case, when prune after "end of sentence" token ([s])
+            confidence_score_list_ocr.append(confidence_score_ocr)
             confidence_score_list_1.append(confidence_score_1)
             confidence_score_list_2.append(confidence_score_2)
             # print(pred, gt, pred==gt, confidence_score)
+
+    accuracy_ocr = n_correct_ocr / float(length_of_data) * 100
+    norm_ED_ocr = norm_ED_ocr / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
 
     accuracy_1 = n_correct_1 / float(length_of_data) * 100
     norm_ED_1 = norm_ED_1 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
@@ -340,7 +373,698 @@ def validation_synth(iterCntr, synthModel, ocrModel, recCriterion, ocrCriterion,
     accuracy_2 = n_correct_2 / float(length_of_data) * 100
     norm_ED_2 = norm_ED_2 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
 
-    return valid_loss_avg.val(), [accuracy_1,accuracy_2], [norm_ED_1,norm_ED_2], [preds_str_1,preds_str_2], [confidence_score_list_1,confidence_score_list_2], [labels_1,labels_2], infer_time, length_of_data
+    return [valid_loss_avg_ocr.val(), valid_loss_avg.val()], [accuracy_ocr,accuracy_1,accuracy_2], [norm_ED_ocr,norm_ED_1,norm_ED_2], [preds_str_ocr, preds_str_1,preds_str_2], [confidence_score_list_ocr,confidence_score_list_1,confidence_score_list_2], [labels_1,labels_1,labels_2], infer_time, length_of_data
+
+def validation_synth_adv(iterCntr, synthModel, ocrModel, disModel, recCriterion, ocrCriterion, evaluation_loader, converter, opt):
+    """ validation or evaluation """
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
+
+    n_correct_ocr = 0
+    norm_ED_ocr = 0
+
+    n_correct_1 = 0
+    norm_ED_1 = 0
+    n_correct_2 = 0
+    norm_ED_2 = 0
+
+    length_of_data = 0
+    infer_time = 0
+    valid_loss_avg_ocr = Averager()
+    valid_loss_avg = Averager()
+    valid_loss_avg_dis = Averager()
+
+    lexicons=[]
+    out_of_char = f'[^{opt.character}]'
+    #read lexicons file
+    with open(opt.lexFile,'r') as lexF:
+        for line in lexF:
+            lexWord = line[:-1]
+            if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())):
+                lexicons.append(lexWord)
+
+    for i, (image_tensors_all, labels_1_all) in enumerate(evaluation_loader):
+        # print(i)
+        if opt.debugFlag and i>2:
+            break
+        
+        disCnt = int(image_tensors_all.size(0)/2)
+        image_tensors, image_tensors_real, labels_1 = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt]
+
+        batch_size = image_tensors.size(0)
+        #generate lexicons
+        labels_2 = random.sample(lexicons, batch_size)
+
+
+        length_of_data = length_of_data + batch_size
+        image = image_tensors.to(device)
+        image_real = image_tensors_real.to(device)
+
+        # For max length prediction
+        length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+        text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+
+        text_for_loss_1, length_for_loss_1 = converter.encode(labels_1, batch_max_length=opt.batch_max_length)
+        text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
+        
+        start_time = time.time()
+        images_recon_1, images_recon_2, _ = synthModel(image, text_for_loss_1, text_for_loss_2)
+
+        #Save random reconstructed image and write its gt
+        rIdx = random.randint(0,batch_size-1)
+        try:
+            save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_input_'+labels_1[rIdx]+'.png'))
+            save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_recon_'+labels_1[rIdx]+'.png'))
+            save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_pair_'+labels_2[rIdx]+'.png'))
+        except:
+            print('Warning while saving validation image')
+        
+        
+        if 'CTC' in opt.Prediction:
+            preds_ocr = ocrModel(image, text_for_pred)
+            preds_1 = ocrModel(images_recon_1, text_for_pred)
+            preds_2 = ocrModel(images_recon_2, text_for_pred)
+
+            forward_time = time.time() - start_time
+
+            # Calculate evaluation loss for CTC deocder.
+            preds_size_1 = torch.IntTensor([preds_1.size(1)] * batch_size)
+            preds_size_2 = torch.IntTensor([preds_2.size(1)] * batch_size)
+
+            # permute 'preds' to use CTCloss format
+            ocrCost_ocr = ocrCriterion(preds_ocr.log_softmax(2).permute(1, 0, 2), text_for_loss_1, preds_size_1, length_for_loss_1)
+            ocrCost_1 = ocrCriterion(preds_1.log_softmax(2).permute(1, 0, 2), text_for_loss_1, preds_size_1, length_for_loss_1)
+            ocrCost_2 = ocrCriterion(preds_2.log_softmax(2).permute(1, 0, 2), text_for_loss_2, preds_size_2, length_for_loss_2)
+
+            # Select max probabilty (greedy decoding) then decode index to character
+            _, preds_index_ocr = preds_ocr.max(2)
+            _, preds_index_1 = preds_1.max(2)
+            _, preds_index_2 = preds_2.max(2)
+            preds_str_ocr = converter.decode(preds_index_ocr.data, preds_size_1.data)
+            preds_str_1 = converter.decode(preds_index_1.data, preds_size_1.data)
+            preds_str_2 = converter.decode(preds_index_2.data, preds_size_2.data)
+
+            disCost = 0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
+            disGenCost = 0.5*(disModel.module.calc_gen_loss(images_recon_1)+disModel.module.calc_gen_loss(images_recon_2))
+        else:
+            
+            preds = model(image, text_for_pred, is_train=False)
+            forward_time = time.time() - start_time
+
+            preds = preds[:, :text_for_loss.shape[1] - 1, :]
+            target = text_for_loss[:, 1:]  # without [GO] Symbol
+            cost = criterion(preds.contiguous().view(-1, preds.shape[-1]), target.contiguous().view(-1))
+
+            # select max probabilty (greedy decoding) then decode index to character
+            _, preds_index = preds.max(2)
+            preds_str = converter.decode(preds_index, length_for_pred)
+            labels = converter.decode(text_for_loss[:, 1:], length_for_loss)
+
+        recCost = recCriterion(images_recon_1,image)
+
+        infer_time += forward_time
+        valid_loss_avg_ocr.add(ocrCost_ocr)
+        valid_loss_avg.add(opt.ocrWeight*(0.5*(ocrCost_1+ocrCost_2))+opt.reconWeight*recCost+opt.disWeight*disGenCost)
+        valid_loss_avg_dis.add(opt.disWeight*disCost)
+
+        # calculate accuracy & confidence score
+        preds_prob_ocr = F.softmax(preds_ocr, dim=2)
+        preds_max_prob_ocr, _ = preds_prob_ocr.max(dim=2)
+
+        preds_prob_1 = F.softmax(preds_1, dim=2)
+        preds_max_prob_1, _ = preds_prob_1.max(dim=2)
+
+        preds_prob_2 = F.softmax(preds_2, dim=2)
+        preds_max_prob_2, _ = preds_prob_2.max(dim=2)
+
+        confidence_score_list_ocr = []
+        confidence_score_list_1 = []
+        confidence_score_list_2 = []
+        for gt_ocr, pred_ocr, pred_max_prob_ocr, gt_1, pred_1, pred_max_prob_1, gt_2, pred_2, pred_max_prob_2 in zip(labels_1, preds_str_ocr, preds_max_prob_ocr, labels_1, preds_str_1, preds_max_prob_1, labels_2, preds_str_2, preds_max_prob_2):
+            if 'Attn' in opt.Prediction:
+                gt = gt[:gt.find('[s]')]
+                pred_EOS = pred.find('[s]')
+                pred = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+                pred_max_prob = pred_max_prob[:pred_EOS]
+
+            # To evaluate 'case sensitive model' with alphanumeric and case insensitve setting.
+            if opt.sensitive and opt.data_filtering_off:
+                pred = pred.lower()
+                gt = gt.lower()
+                alphanumeric_case_insensitve = '0123456789abcdefghijklmnopqrstuvwxyz'
+                out_of_alphanumeric_case_insensitve = f'[^{alphanumeric_case_insensitve}]'
+                pred = re.sub(out_of_alphanumeric_case_insensitve, '', pred)
+                gt = re.sub(out_of_alphanumeric_case_insensitve, '', gt)
+
+            if pred_ocr == gt_ocr:
+                n_correct_ocr += 1
+
+            if pred_1 == gt_1:
+                n_correct_1 += 1
+            
+            if pred_2 == gt_2:
+                n_correct_2 += 1
+
+            '''
+            (old version) ICDAR2017 DOST Normalized Edit Distance https://rrc.cvc.uab.es/?ch=7&com=tasks
+            "For each word we calculate the normalized edit distance to the length of the ground truth transcription."
+            if len(gt) == 0:
+                norm_ED += 1
+            else:
+                norm_ED += edit_distance(pred, gt) / len(gt)
+            '''
+
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_1) == 0 or len(pred_1) == 0:
+                norm_ED_1 += 0
+            elif len(gt_1) > len(pred_1):
+                norm_ED_1 += 1 - edit_distance(pred_1, gt_1) / len(gt_1)
+            else:
+                norm_ED_1 += 1 - edit_distance(pred_1, gt_1) / len(pred_1)
+
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_2) == 0 or len(pred_2) == 0:
+                norm_ED_2 += 0
+            elif len(gt_2) > len(pred_2):
+                norm_ED_2 += 1 - edit_distance(pred_2, gt_2) / len(gt_2)
+            else:
+                norm_ED_2 += 1 - edit_distance(pred_2, gt_2) / len(pred_2)
+            
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_ocr) == 0 or len(pred_ocr) == 0:
+                norm_ED_ocr += 0
+            elif len(gt_ocr) > len(pred_ocr):
+                norm_ED_ocr += 1 - edit_distance(pred_ocr, gt_ocr) / len(gt_ocr)
+            else:
+                norm_ED_ocr += 1 - edit_distance(pred_ocr, gt_ocr) / len(pred_ocr)
+
+            # calculate confidence score (= multiply of pred_max_prob)
+            try:
+                confidence_score_ocr = pred_max_prob_ocr.cumprod(dim=0)[-1]
+                confidence_score_1 = pred_max_prob_1.cumprod(dim=0)[-1]
+                confidence_score_2 = pred_max_prob_2.cumprod(dim=0)[-1]
+            except:
+                confidence_score_ocr = 0
+                confidence_score_1 = 0  # for empty pred case, when prune after "end of sentence" token ([s])
+                confidence_score_2 = 0  # for empty pred case, when prune after "end of sentence" token ([s])
+            confidence_score_list_ocr.append(confidence_score_ocr)
+            confidence_score_list_1.append(confidence_score_1)
+            confidence_score_list_2.append(confidence_score_2)
+            # print(pred, gt, pred==gt, confidence_score)
+
+    accuracy_ocr = n_correct_ocr / float(length_of_data) * 100
+    norm_ED_ocr = norm_ED_ocr / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    accuracy_1 = n_correct_1 / float(length_of_data) * 100
+    norm_ED_1 = norm_ED_1 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    accuracy_2 = n_correct_2 / float(length_of_data) * 100
+    norm_ED_2 = norm_ED_2 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    return [valid_loss_avg_ocr.val(), valid_loss_avg.val(), valid_loss_avg_dis.val()], [accuracy_ocr,accuracy_1,accuracy_2], [norm_ED_ocr,norm_ED_1,norm_ED_2], [preds_str_ocr, preds_str_1,preds_str_2], [confidence_score_list_ocr,confidence_score_list_1,confidence_score_list_2], [labels_1,labels_1,labels_2], infer_time, length_of_data
+
+def validation_synth_lrw(iterCntr, synthModel, ocrModel, disModel, recCriterion, styleRecCriterion, ocrCriterion, evaluation_loader, converter, opt):
+    """ validation or evaluation """
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
+
+    n_correct_ocr = 0
+    norm_ED_ocr = 0
+
+    n_correct_1 = 0
+    norm_ED_1 = 0
+    n_correct_2 = 0
+    norm_ED_2 = 0
+
+    length_of_data = 0
+    infer_time = 0
+    valid_loss_avg_ocr = Averager()
+    valid_loss_avg = Averager()
+    valid_loss_avg_dis = Averager()
+
+    lexicons=[]
+    out_of_char = f'[^{opt.character}]'
+    #read lexicons file
+    with open(opt.lexFile,'r') as lexF:
+        for line in lexF:
+            lexWord = line[:-1]
+            if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())):
+                lexicons.append(lexWord)
+
+    for i, (image_tensors_all, labels_1_all) in enumerate(evaluation_loader):
+        # print(i)
+        if opt.debugFlag and i>2:
+            break
+        
+        disCnt = int(image_tensors_all.size(0)/2)
+        image_tensors, image_tensors_real, labels_1 = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt]
+        
+        
+
+        batch_size = image_tensors.size(0)
+        #generate lexicons
+        labels_2 = random.sample(lexicons, batch_size)
+
+
+        length_of_data = length_of_data + batch_size
+        image = image_tensors.to(device)
+        image_real = image_tensors_real.to(device)
+
+        # For max length prediction
+        length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+        text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+
+        text_for_loss_1, length_for_loss_1 = converter.encode(labels_1, batch_max_length=opt.batch_max_length)
+        text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
+        
+        start_time = time.time()
+        images_recon_1, images_recon_2, style = synthModel(image, text_for_loss_1, text_for_loss_2)
+
+        #Save random reconstructed image and write its gt
+        rIdx = random.randint(0,batch_size-1)
+        try:
+            save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_input_'+labels_1[rIdx]+'.png'))
+            save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_recon_'+labels_1[rIdx]+'.png'))
+            save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_pair_'+labels_2[rIdx]+'.png'))
+        except:
+            print('Warning while saving validation image')
+        
+        
+        if 'CTC' in opt.Prediction:
+            preds_ocr = ocrModel(image, text_for_pred)
+            preds_1 = ocrModel(images_recon_1, text_for_pred)
+            preds_2 = ocrModel(images_recon_2, text_for_pred)
+
+            forward_time = time.time() - start_time
+
+            # Calculate evaluation loss for CTC deocder.
+            preds_size_1 = torch.IntTensor([preds_1.size(1)] * batch_size)
+            preds_size_2 = torch.IntTensor([preds_2.size(1)] * batch_size)
+
+            # permute 'preds' to use CTCloss format
+            ocrCost_ocr = ocrCriterion(preds_ocr.log_softmax(2).permute(1, 0, 2), text_for_loss_1, preds_size_1, length_for_loss_1)
+            ocrCost_1 = ocrCriterion(preds_1.log_softmax(2).permute(1, 0, 2), text_for_loss_1, preds_size_1, length_for_loss_1)
+            ocrCost_2 = ocrCriterion(preds_2.log_softmax(2).permute(1, 0, 2), text_for_loss_2, preds_size_2, length_for_loss_2)
+
+            # Select max probabilty (greedy decoding) then decode index to character
+            _, preds_index_ocr = preds_ocr.max(2)
+            _, preds_index_1 = preds_1.max(2)
+            _, preds_index_2 = preds_2.max(2)
+            preds_str_ocr = converter.decode(preds_index_ocr.data, preds_size_1.data)
+            preds_str_1 = converter.decode(preds_index_1.data, preds_size_1.data)
+            preds_str_2 = converter.decode(preds_index_2.data, preds_size_2.data)
+
+            disCost = 0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
+            disGenCost = 0.5*(disModel.module.calc_gen_loss(images_recon_1)+disModel.module.calc_gen_loss(images_recon_2))
+        else:
+            
+            preds = model(image, text_for_pred, is_train=False)
+            forward_time = time.time() - start_time
+
+            preds = preds[:, :text_for_loss.shape[1] - 1, :]
+            target = text_for_loss[:, 1:]  # without [GO] Symbol
+            cost = criterion(preds.contiguous().view(-1, preds.shape[-1]), target.contiguous().view(-1))
+
+            # select max probabilty (greedy decoding) then decode index to character
+            _, preds_index = preds.max(2)
+            preds_str = converter.decode(preds_index, length_for_pred)
+            labels = converter.decode(text_for_loss[:, 1:], length_for_loss)
+
+        recCost = recCriterion(images_recon_1,image)
+        styleRecCost = styleRecCriterion(synthModel(images_recon_2, None, None, styleFlag=True), style.detach())
+
+        infer_time += forward_time
+        valid_loss_avg_ocr.add(ocrCost_ocr)
+        valid_loss_avg.add(opt.ocrWeight*(0.5*(ocrCost_1+ocrCost_2))+opt.reconWeight*recCost+opt.disWeight*disGenCost+opt.styleReconWeight*styleRecCost)
+        valid_loss_avg_dis.add(opt.disWeight*disCost)
+
+        # calculate accuracy & confidence score
+        preds_prob_ocr = F.softmax(preds_ocr, dim=2)
+        preds_max_prob_ocr, _ = preds_prob_ocr.max(dim=2)
+
+        preds_prob_1 = F.softmax(preds_1, dim=2)
+        preds_max_prob_1, _ = preds_prob_1.max(dim=2)
+
+        preds_prob_2 = F.softmax(preds_2, dim=2)
+        preds_max_prob_2, _ = preds_prob_2.max(dim=2)
+
+        confidence_score_list_ocr = []
+        confidence_score_list_1 = []
+        confidence_score_list_2 = []
+        for gt_ocr, pred_ocr, pred_max_prob_ocr, gt_1, pred_1, pred_max_prob_1, gt_2, pred_2, pred_max_prob_2 in zip(labels_1, preds_str_ocr, preds_max_prob_ocr, labels_1, preds_str_1, preds_max_prob_1, labels_2, preds_str_2, preds_max_prob_2):
+            if 'Attn' in opt.Prediction:
+                gt = gt[:gt.find('[s]')]
+                pred_EOS = pred.find('[s]')
+                pred = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+                pred_max_prob = pred_max_prob[:pred_EOS]
+
+            # To evaluate 'case sensitive model' with alphanumeric and case insensitve setting.
+            if opt.sensitive and opt.data_filtering_off:
+                pred = pred.lower()
+                gt = gt.lower()
+                alphanumeric_case_insensitve = '0123456789abcdefghijklmnopqrstuvwxyz'
+                out_of_alphanumeric_case_insensitve = f'[^{alphanumeric_case_insensitve}]'
+                pred = re.sub(out_of_alphanumeric_case_insensitve, '', pred)
+                gt = re.sub(out_of_alphanumeric_case_insensitve, '', gt)
+
+            if pred_ocr == gt_ocr:
+                n_correct_ocr += 1
+
+            if pred_1 == gt_1:
+                n_correct_1 += 1
+            
+            if pred_2 == gt_2:
+                n_correct_2 += 1
+
+            '''
+            (old version) ICDAR2017 DOST Normalized Edit Distance https://rrc.cvc.uab.es/?ch=7&com=tasks
+            "For each word we calculate the normalized edit distance to the length of the ground truth transcription."
+            if len(gt) == 0:
+                norm_ED += 1
+            else:
+                norm_ED += edit_distance(pred, gt) / len(gt)
+            '''
+
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_1) == 0 or len(pred_1) == 0:
+                norm_ED_1 += 0
+            elif len(gt_1) > len(pred_1):
+                norm_ED_1 += 1 - edit_distance(pred_1, gt_1) / len(gt_1)
+            else:
+                norm_ED_1 += 1 - edit_distance(pred_1, gt_1) / len(pred_1)
+
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_2) == 0 or len(pred_2) == 0:
+                norm_ED_2 += 0
+            elif len(gt_2) > len(pred_2):
+                norm_ED_2 += 1 - edit_distance(pred_2, gt_2) / len(gt_2)
+            else:
+                norm_ED_2 += 1 - edit_distance(pred_2, gt_2) / len(pred_2)
+            
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_ocr) == 0 or len(pred_ocr) == 0:
+                norm_ED_ocr += 0
+            elif len(gt_ocr) > len(pred_ocr):
+                norm_ED_ocr += 1 - edit_distance(pred_ocr, gt_ocr) / len(gt_ocr)
+            else:
+                norm_ED_ocr += 1 - edit_distance(pred_ocr, gt_ocr) / len(pred_ocr)
+
+            # calculate confidence score (= multiply of pred_max_prob)
+            try:
+                confidence_score_ocr = pred_max_prob_ocr.cumprod(dim=0)[-1]
+                confidence_score_1 = pred_max_prob_1.cumprod(dim=0)[-1]
+                confidence_score_2 = pred_max_prob_2.cumprod(dim=0)[-1]
+            except:
+                confidence_score_ocr = 0
+                confidence_score_1 = 0  # for empty pred case, when prune after "end of sentence" token ([s])
+                confidence_score_2 = 0  # for empty pred case, when prune after "end of sentence" token ([s])
+            confidence_score_list_ocr.append(confidence_score_ocr)
+            confidence_score_list_1.append(confidence_score_1)
+            confidence_score_list_2.append(confidence_score_2)
+            # print(pred, gt, pred==gt, confidence_score)
+
+    accuracy_ocr = n_correct_ocr / float(length_of_data) * 100
+    norm_ED_ocr = norm_ED_ocr / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    accuracy_1 = n_correct_1 / float(length_of_data) * 100
+    norm_ED_1 = norm_ED_1 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    accuracy_2 = n_correct_2 / float(length_of_data) * 100
+    norm_ED_2 = norm_ED_2 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    return [valid_loss_avg_ocr.val(), valid_loss_avg.val(), valid_loss_avg_dis.val()], [accuracy_ocr,accuracy_1,accuracy_2], [norm_ED_ocr,norm_ED_1,norm_ED_2], [preds_str_ocr, preds_str_1,preds_str_2], [confidence_score_list_ocr,confidence_score_list_1,confidence_score_list_2], [labels_1,labels_1,labels_2], infer_time, length_of_data
+
+def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriterion, styleRecCriterion, ocrCriterion, evaluation_loader, converter, opt):
+    """ validation or evaluation """
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
+
+    n_correct_ocr = 0
+    norm_ED_ocr = 0
+
+    n_correct_1 = 0
+    norm_ED_1 = 0
+    n_correct_2 = 0
+    norm_ED_2 = 0
+
+    length_of_data = 0
+    infer_time = 0
+    valid_loss_avg_ocr = Averager()
+    valid_loss_avg = Averager()
+    valid_loss_avg_dis = Averager()
+
+    lexicons=[]
+    out_of_char = f'[^{opt.character}]'
+    #read lexicons file
+    with open(opt.lexFile,'r') as lexF:
+        for line in lexF:
+            lexWord = line[:-1]
+            if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())):
+                lexicons.append(lexWord)
+
+    for i, (image_tensors_all, labels_1_all) in enumerate(evaluation_loader):
+        # print(i)
+        if opt.debugFlag and i>2:
+            break
+        
+        disCnt = int(image_tensors_all.size(0)/2)
+        image_tensors, image_tensors_real, labels_gt = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt]
+        image = image_tensors.to(device)
+        image_real = image_tensors_real.to(device)
+        batch_size = image_tensors.size(0)
+
+        ##-----------------------------------##
+        #generate text(labels) from ocr.forward
+        if opt.ocrFixed:
+            length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+            text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+            
+            if 'CTC' in opt.Prediction:
+                preds = ocrModel(image, text_for_pred)
+                preds_size = torch.IntTensor([preds.size(1)] * batch_size)
+                _, preds_index = preds.max(2)
+                labels_1 = converter.decode(preds_index.data, preds_size.data)
+            else:
+                preds = ocrModel(image, text_for_pred, is_train=False)
+                _, preds_index = preds.max(2)
+                labels_1 = converter.decode(preds_index, length_for_pred)
+                for idx, pred in enumerate(labels_1):
+                    pred_EOS = pred.find('[s]')
+                    labels_1[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+        else:
+            labels_1 = labels_gt
+        ##-----------------------------------##
+        
+        #generate lexicon labels
+        labels_2 = random.sample(lexicons, batch_size)
+
+        length_of_data = length_of_data + batch_size
+        
+
+        # For max length prediction
+        length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+        text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+
+        text_for_loss_ocr, length_for_loss_ocr = converter.encode(labels_gt, batch_max_length=opt.batch_max_length)
+        text_for_loss_1, length_for_loss_1 = converter.encode(labels_1, batch_max_length=opt.batch_max_length)
+        text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
+        
+        start_time = time.time()
+        images_recon_1, images_recon_2, style = synthModel(image, text_for_loss_1, text_for_loss_2)
+
+        #Save random reconstructed image and write its gt
+        rIdx = random.randint(0,batch_size-1)
+        try:
+            save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_input_'+labels_gt[rIdx]+'.png'))
+            save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_recon_'+labels_1[rIdx]+'.png'))
+            save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_pair_'+labels_2[rIdx]+'.png'))
+        except:
+            print('Warning while saving validation image')
+        
+        
+        if 'CTC' in opt.Prediction:
+            # if not opt.ocrFixed:
+            #ocr evaluations with orig image
+            preds_ocr = ocrModel(image, text_for_pred)
+            preds_size_ocr = torch.IntTensor([preds_ocr.size(1)] * batch_size)
+            ocrCost_ocr = ocrCriterion(preds_ocr.log_softmax(2).permute(1, 0, 2), text_for_loss_ocr, preds_size_ocr, length_for_loss_ocr)
+            _, preds_index_ocr = preds_ocr.max(2)
+            preds_str_ocr = converter.decode(preds_index_ocr.data, preds_size_ocr.data)
+            
+            #content loss for reconstructed images
+            # permute 'preds' to use CTCloss format
+            preds_1 = ocrModel(images_recon_1, text_for_pred)
+            preds_size_1 = torch.IntTensor([preds_1.size(1)] * batch_size)
+            ocrCost_1 = ocrCriterion(preds_1.log_softmax(2).permute(1, 0, 2), text_for_loss_1, preds_size_1, length_for_loss_1)
+            _, preds_index_1 = preds_1.max(2)
+            preds_str_1 = converter.decode(preds_index_1.data, preds_size_1.data)
+            
+            preds_2 = ocrModel(images_recon_2, text_for_pred)
+            preds_size_2 = torch.IntTensor([preds_2.size(1)] * batch_size)
+            ocrCost_2 = ocrCriterion(preds_2.log_softmax(2).permute(1, 0, 2), text_for_loss_2, preds_size_2, length_for_loss_2)
+            _, preds_index_2 = preds_2.max(2)
+            preds_str_2 = converter.decode(preds_index_2.data, preds_size_2.data)
+
+        else:
+            # if not opt.ocrFixed:
+            #ocr evaluations with orig image
+            preds_ocr = ocrModel(image, text_for_pred, is_train=False)
+            preds_ocr = preds_ocr[:, :text_for_loss_1.shape[1] - 1, :]
+            target = text_for_loss_1[:, 1:]  # without [GO] Symbol
+            ocrCost_ocr = ocrCriterion(preds_ocr.contiguous().view(-1, preds_ocr.shape[-1]), target.contiguous().view(-1))
+            _, preds_index = preds_ocr.max(2)
+            preds_str_ocr = converter.decode(preds_index, length_for_pred)
+            # pdb.set_trace()
+            # labels_1 = converter.decode(text_for_loss_1[:, 1:], length_for_loss_1)
+            # else:
+            #     ocrCost_ocr = torch.tensor(0.0)
+            
+            #ocr evaluations with orig image
+            preds_1 = ocrModel(images_recon_1, text_for_pred, is_train=False)
+            preds_1 = preds_1[:, :text_for_loss_1.shape[1] - 1, :]
+            target_1 = text_for_loss_1[:, 1:]  # without [GO] Symbol
+            ocrCost_1 = ocrCriterion(preds_1.contiguous().view(-1, preds_1.shape[-1]), target_1.contiguous().view(-1))
+            _, preds_index_1 = preds_1.max(2)
+            preds_str_1 = converter.decode(preds_index_1, length_for_pred)
+
+            preds_2 = ocrModel(images_recon_2, text_for_pred, is_train=False)
+            preds_2 = preds_2[:, :text_for_loss_2.shape[1] - 1, :]
+            target_2 = text_for_loss_2[:, 1:]  # without [GO] Symbol
+            ocrCost_2 = ocrCriterion(preds_2.contiguous().view(-1, preds_2.shape[-1]), target_2.contiguous().view(-1))
+            _, preds_index_2 = preds_2.max(2)
+            preds_str_2 = converter.decode(preds_index_2, length_for_pred)
+
+        forward_time = time.time() - start_time
+
+        disCost = 0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
+        disGenCost = 0.5*(disModel.module.calc_gen_loss(images_recon_1)+disModel.module.calc_gen_loss(images_recon_2))
+        recCost = recCriterion(images_recon_1,image)
+        styleRecCost = styleRecCriterion(synthModel(images_recon_2, None, None, styleFlag=True), style)
+
+        infer_time += forward_time
+        valid_loss_avg_ocr.add(ocrCost_ocr)
+        valid_loss_avg.add(opt.ocrWeight*(0.5*(ocrCost_1+ocrCost_2))+opt.reconWeight*recCost+opt.disWeight*disGenCost+opt.styleReconWeight*styleRecCost)
+        valid_loss_avg_dis.add(opt.disWeight*disCost)
+
+        # if not opt.ocrFixed:
+        # calculate accuracy & confidence score
+        preds_prob_ocr = F.softmax(preds_ocr, dim=2)
+        preds_max_prob_ocr, _ = preds_prob_ocr.max(dim=2)
+
+        preds_prob_1 = F.softmax(preds_1, dim=2)
+        preds_max_prob_1, _ = preds_prob_1.max(dim=2)
+
+        preds_prob_2 = F.softmax(preds_2, dim=2)
+        preds_max_prob_2, _ = preds_prob_2.max(dim=2)
+
+        confidence_score_list_ocr = []
+        confidence_score_list_1 = []
+        confidence_score_list_2 = []
+
+        # zCntr=0
+        for gt_ocr, pred_ocr, pred_max_prob_ocr, gt_1, pred_1, pred_max_prob_1, gt_2, pred_2, pred_max_prob_2 in zip(labels_gt, preds_str_ocr, preds_max_prob_ocr, labels_1, preds_str_1, preds_max_prob_1, labels_2, preds_str_2, preds_max_prob_2):
+            if 'Attn' in opt.Prediction:
+                # if not opt.ocrFixed:
+                
+                # gt_ocr = gt_ocr[:gt_ocr.find('[s]')]
+                pred_EOS = pred_ocr.find('[s]')
+                pred_ocr = pred_ocr[:pred_EOS]  # prune after "end of sentence" token ([s])
+                pred_max_prob_ocr = pred_max_prob_ocr[:pred_EOS]
+                
+                # gt_1 = gt_1[:gt_1.find('[s]')]
+                pred_EOS = pred_1.find('[s]')
+                pred_1 = pred_1[:pred_EOS]  # prune after "end of sentence" token ([s])
+                pred_max_prob_1 = pred_max_prob_1[:pred_EOS]
+
+                # gt_2 = gt_2[:gt_2.find('[s]')]
+                pred_EOS = pred_2.find('[s]')
+                pred_2 = pred_2[:pred_EOS]  # prune after "end of sentence" token ([s])
+                pred_max_prob_2 = pred_max_prob_2[:pred_EOS]
+
+            # # To evaluate 'case sensitive model' with alphanumeric and case insensitve setting.
+            # if opt.sensitive and opt.data_filtering_off:
+            #     pred = pred.lower()
+            #     gt = gt.lower()
+            #     alphanumeric_case_insensitve = '0123456789abcdefghijklmnopqrstuvwxyz'
+            #     out_of_alphanumeric_case_insensitve = f'[^{alphanumeric_case_insensitve}]'
+            #     pred = re.sub(out_of_alphanumeric_case_insensitve, '', pred)
+            #     gt = re.sub(out_of_alphanumeric_case_insensitve, '', gt)
+
+            # if not opt.ocrFixed:
+            # pdb.set_trace()
+            if pred_ocr == gt_ocr:
+                n_correct_ocr += 1
+            # else:
+            #     n_correct_ocr=0
+
+            if pred_1 == gt_1:
+                n_correct_1 += 1
+            
+            if pred_2 == gt_2:
+                n_correct_2 += 1
+
+            '''
+            (old version) ICDAR2017 DOST Normalized Edit Distance https://rrc.cvc.uab.es/?ch=7&com=tasks
+            "For each word we calculate the normalized edit distance to the length of the ground truth transcription."
+            if len(gt) == 0:
+                norm_ED += 1
+            else:
+                norm_ED += edit_distance(pred, gt) / len(gt)
+            '''
+
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_1) == 0 or len(pred_1) == 0:
+                norm_ED_1 += 0
+            elif len(gt_1) > len(pred_1):
+                norm_ED_1 += 1 - edit_distance(pred_1, gt_1) / len(gt_1)
+            else:
+                norm_ED_1 += 1 - edit_distance(pred_1, gt_1) / len(pred_1)
+
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_2) == 0 or len(pred_2) == 0:
+                norm_ED_2 += 0
+            elif len(gt_2) > len(pred_2):
+                norm_ED_2 += 1 - edit_distance(pred_2, gt_2) / len(gt_2)
+            else:
+                norm_ED_2 += 1 - edit_distance(pred_2, gt_2) / len(pred_2)
+            
+            # if not opt.ocrFixed:
+            # ICDAR2019 Normalized Edit Distance
+            if len(gt_ocr) == 0 or len(pred_ocr) == 0:
+                norm_ED_ocr += 0
+            elif len(gt_ocr) > len(pred_ocr):
+                norm_ED_ocr += 1 - edit_distance(pred_ocr, gt_ocr) / len(gt_ocr)
+            else:
+                norm_ED_ocr += 1 - edit_distance(pred_ocr, gt_ocr) / len(pred_ocr)
+            # else:
+            #     norm_ED_ocr=0
+
+            # calculate confidence score (= multiply of pred_max_prob)
+            try:
+                # if not opt.ocrFixed:
+                confidence_score_ocr = pred_max_prob_ocr.cumprod(dim=0)[-1]
+                # else:
+                #     confidence_score_ocr = 1.0
+                confidence_score_1 = pred_max_prob_1.cumprod(dim=0)[-1]
+                confidence_score_2 = pred_max_prob_2.cumprod(dim=0)[-1]
+            except:
+                confidence_score_ocr = 0
+                confidence_score_1 = 0  # for empty pred case, when prune after "end of sentence" token ([s])
+                confidence_score_2 = 0  # for empty pred case, when prune after "end of sentence" token ([s])
+            confidence_score_list_ocr.append(confidence_score_ocr)
+            confidence_score_list_1.append(confidence_score_1)
+            confidence_score_list_2.append(confidence_score_2)
+            # print(pred, gt, pred==gt, confidence_score)
+            
+            # zCntr+=1
+
+    accuracy_ocr = n_correct_ocr / float(length_of_data) * 100
+    norm_ED_ocr = norm_ED_ocr / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    accuracy_1 = n_correct_1 / float(length_of_data) * 100
+    norm_ED_1 = norm_ED_1 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    accuracy_2 = n_correct_2 / float(length_of_data) * 100
+    norm_ED_2 = norm_ED_2 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+
+    return [valid_loss_avg_ocr.val(), valid_loss_avg.val(), valid_loss_avg_dis.val()], [accuracy_ocr,accuracy_1,accuracy_2], [norm_ED_ocr,norm_ED_1,norm_ED_2], [preds_str_ocr, preds_str_1,preds_str_2], [confidence_score_list_ocr,confidence_score_list_1,confidence_score_list_2], [labels_gt,labels_1,labels_2], infer_time, length_of_data
 
 def test(opt):
     """ model configuration """

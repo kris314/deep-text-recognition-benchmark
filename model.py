@@ -16,13 +16,15 @@ limitations under the License.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from modules.transformation import TPS_SpatialTransformerNetwork
 from modules.feature_extraction import VGG_FeatureExtractor, RCNN_FeatureExtractor, ResNet_FeatureExtractor
 from modules.sequence_modeling import BidirectionalLSTM
 from modules.prediction import Attention
 from modules.content_encoder import LocalContentEncoder
-from modules.word_generator import WordGenerator,MLP
+from modules.word_generator import WordGenerator,MLP, Conv2dBlock
+
 
 import pdb
 
@@ -122,23 +124,29 @@ class AdaINGen(nn.Module):
         #     raise Exception('No FeatureExtraction module specified')
         
         #char embedding
-        self.batch_max_length = opt.batch_max_length
+        if 'CTC' in opt.Prediction:
+            self.batch_max_length = opt.batch_max_length
+        else:
+            self.batch_max_length = opt.batch_max_length+2  #adding go and eos symbol
         self.char_embed_size = opt.char_embed_size
         self.charEmbed = nn.Embedding(opt.num_class, opt.char_embed_size)
 
         # content encoder
         self.enc_content_g1 = LocalContentEncoder(opt.char_embed_size)
         n_downsample = ((2,1),(2,1),(2,2),(2,2))
-        self.dec = WordGenerator(n_downsample, 2, 512+opt.char_embed_size, 3, res_norm='adain', activ='relu', pad_type='reflect')
+        self.dec = WordGenerator(n_downsample, 2, 512+opt.char_embed_size, opt.input_channel, res_norm='adain', activ='relu', pad_type='zero')
 
         # MLP to generate AdaIN parameters
         #g2 Content encoding
-        self.mlp = MLP(opt.char_embed_size*opt.batch_max_length, self.get_num_adain_params(self.dec), 1024, 3, norm='bn', activ='relu')
+        self.mlp = MLP(opt.char_embed_size*self.batch_max_length, self.get_num_adain_params(self.dec), 1024, 3, norm='bn', activ='relu')
 
-    def forward(self, images, labels_1, labels_2):
+    def forward(self, images, labels_1, labels_2, styleFlag=False):
         # reconstruct an image
         
         style = self.enc_style(images)
+
+        if styleFlag:
+            return style
         
         g1content_1 = self.enc_content_g1(self.charEmbed(labels_1))
         g1content_2 = self.enc_content_g1(self.charEmbed(labels_2))
@@ -157,7 +165,7 @@ class AdaINGen(nn.Module):
         images_recon_1 = self.decode(latent_1, self.charEmbed(labels_1).reshape(-1,self.char_embed_size*self.batch_max_length))
         images_recon_2 = self.decode(latent_2, self.charEmbed(labels_2).reshape(-1,self.char_embed_size*self.batch_max_length))
 
-        return images_recon_1, images_recon_2
+        return images_recon_1, images_recon_2, style
 
     def decode(self, input, labels):
         # decode content and style codes to an image
@@ -185,3 +193,72 @@ class AdaINGen(nn.Module):
             if m.__class__.__name__ == "AdaptiveInstanceNorm2d":
                 num_adain_params += 2*m.num_features
         return num_adain_params
+
+
+class MsImageDis(nn.Module):
+    # Multi-scale discriminator architecture
+    def __init__(self, opt):
+        super(MsImageDis, self).__init__()
+        self.n_layer = 3
+        self.gan_type = 'lsgan'
+        self.dim = 64
+        self.norm = 'none'
+        self.activ = 'lrelu'
+        self.num_scales = 3
+        self.pad_type = 'zero'
+        self.input_dim = opt.input_channel
+        self.downsample = nn.AvgPool2d(2, stride=1, padding=[1, 1], count_include_pad=False)
+        self.cnns = nn.ModuleList()
+        for _ in range(self.num_scales):
+            self.cnns.append(self._make_net())
+
+    def _make_net(self):
+        dim = self.dim
+        cnn_x = []
+        cnn_x += [Conv2dBlock(self.input_dim, dim, 3, 2, 1, norm='none', activation=self.activ, pad_type=self.pad_type)]
+        for i in range(self.n_layer - 1):
+            cnn_x += [Conv2dBlock(dim, dim * 2, 3, 2, 1, norm=self.norm, activation=self.activ, pad_type=self.pad_type)]
+            dim *= 2
+        cnn_x += [nn.Conv2d(dim, 1, 1, 1, 0)]
+        cnn_x = nn.Sequential(*cnn_x)
+        return cnn_x
+
+    def forward(self, x):
+        outputs = []
+        # pdb.set_trace()
+        for model in self.cnns:
+            outputs.append(model(x))
+            x = self.downsample(x)
+        return outputs
+
+    def calc_dis_loss(self, input_fake, input_real):
+        # calculate the loss to train D
+        outs0 = self.forward(input_fake)
+        outs1 = self.forward(input_real)
+        loss = 0
+
+        for it, (out0, out1) in enumerate(zip(outs0, outs1)):
+            if self.gan_type == 'lsgan':
+                loss += torch.mean((out0 - 0)**2) + torch.mean((out1 - 1)**2)
+            elif self.gan_type == 'nsgan':
+                all0 = torch.zeros_like(out0.data).cuda()
+                all1 = torch.ones_like(out1.data).cuda()
+                loss += torch.mean(F.binary_cross_entropy(F.sigmoid(out0), all0) +
+                                   F.binary_cross_entropy(F.sigmoid(out1), all1))
+            else:
+                assert 0, "Unsupported GAN type: {}".format(self.gan_type)
+        return loss
+
+    def calc_gen_loss(self, input_fake):
+        # calculate the loss to train G
+        outs0 = self.forward(input_fake)
+        loss = 0
+        for it, (out0) in enumerate(outs0):
+            if self.gan_type == 'lsgan':
+                loss += torch.mean((out0 - 1)**2) # LSGAN
+            elif self.gan_type == 'nsgan':
+                all1 = torch.ones_like(out0.data).cuda()
+                loss += torch.mean(F.binary_cross_entropy(F.sigmoid(out0), all1))
+            else:
+                assert 0, "Unsupported GAN type: {}".format(self.gan_type)
+        return loss
