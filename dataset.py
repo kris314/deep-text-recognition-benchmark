@@ -88,7 +88,9 @@ class Batch_Balanced_Dataset(object):
             with open(opt.lexFile,'r') as lexF:
                 for line in lexF:
                     lexWord = line[:-1]
-                    if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())):
+                    if opt.fixedString and len(lexWord)!=opt.batch_exact_length:
+                        continue
+                    if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())) and len(lexWord) >= opt.batch_min_length:
                         self.lexicons.append(lexWord)
             
 
@@ -179,7 +181,9 @@ class LmdbDataset(Dataset):
                     label_key = 'label-%09d'.encode() % index
                     label = txn.get(label_key).decode('utf-8')
 
-                    if len(label) > self.opt.batch_max_length:
+                    if self.opt.fixedString and len(label) != self.opt.batch_exact_length :
+                        continue
+                    elif len(label) > self.opt.batch_max_length or len(label)<self.opt.batch_min_length:
                         # print(f'The length of the label is longer than max_length: length
                         # {len(label)}, {label} in dataset {self.root}')
                         continue
@@ -189,7 +193,7 @@ class LmdbDataset(Dataset):
                     out_of_char = f'[^{self.opt.character}]'
                     if re.search(out_of_char, label.lower()):
                         continue
-
+                    
                     self.filtered_index_list.append(index)
 
                 self.nSamples = len(self.filtered_index_list)

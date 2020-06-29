@@ -51,7 +51,7 @@ def train(opt):
     valid_dataset, valid_dataset_log = hierarchical_dataset(root=opt.valid_data, opt=opt)
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset, batch_size=opt.batch_size,
-        shuffle=True,  # 'True' to check training progress with validation function.
+        shuffle=False,  # 'True' to check training progress with validation function.
         num_workers=int(opt.workers),
         collate_fn=AlignCollate_valid, pin_memory=True)
     log.write(valid_dataset_log)
@@ -99,6 +99,12 @@ def train(opt):
     ocrModel = torch.nn.DataParallel(ocrModel).to(device)
     if not opt.ocrFixed:
         ocrModel.train()
+    else:
+        ocrModel.module.Transformation.eval()
+        ocrModel.module.FeatureExtraction.eval()
+        ocrModel.module.AdaptiveAvgPool.eval()
+        # ocrModel.module.SequenceModeling.eval()
+        ocrModel.module.Prediction.eval()
 
     model = torch.nn.DataParallel(model).to(device)
     model.train()
@@ -147,6 +153,12 @@ def train(opt):
     loss_avg_ocr = Averager()
     loss_avg = Averager()
     loss_avg_dis = Averager()
+
+    loss_avg_ocrRecon_1 = Averager()
+    loss_avg_ocrRecon_2 = Averager()
+    loss_avg_gen = Averager()
+    loss_avg_imgRecon = Averager()
+    loss_avg_styRecon = Averager()
 
     ##---------------------------------------##
     # filter that only require gradient decent
@@ -240,7 +252,7 @@ def train(opt):
         # print(cntr)
         # cntr+=1
         disCnt = int(image_tensors_all.size(0)/2)
-        image_tensors, image_tensors_real, labels_1, labels_2 = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt], labels_2_all[:disCnt]
+        image_tensors, image_tensors_real, labels_gt, labels_2 = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt], labels_2_all[:disCnt]
 
         image = image_tensors.to(device)
         image_real = image_tensors_real.to(device)
@@ -250,6 +262,7 @@ def train(opt):
         ##-----------------------------------##
         #generate text(labels) from ocr.forward
         if opt.ocrFixed:
+            # ocrModel.eval()
             length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
             text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
             
@@ -266,14 +279,16 @@ def train(opt):
                 for idx, pred in enumerate(labels_1):
                     pred_EOS = pred.find('[s]')
                     labels_1[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
-
+            # ocrModel.train()
+        else:
+            labels_1 = labels_gt
+        
         ##-----------------------------------##
 
         text_1, length_1 = converter.encode(labels_1, batch_max_length=opt.batch_max_length)
         text_2, length_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
         
         #forward pass from style and word generator
-        
         images_recon_1, images_recon_2, style = model(image, text_1, text_2)
 
         if 'CTC' in opt.Prediction:
@@ -285,7 +300,8 @@ def train(opt):
                 preds_ocr = preds_ocr.log_softmax(2).permute(1, 0, 2)
 
                 ocrCost_train = ocrCriterion(preds_ocr, text_1, preds_size_ocr, length_1)
-  
+
+            
             #content loss for reconstructed images
             preds_1 = ocrModel(images_recon_1, text_1)
             preds_size_1 = torch.IntTensor([preds_1.size(1)] * batch_size)
@@ -294,8 +310,9 @@ def train(opt):
             preds_2 = ocrModel(images_recon_2, text_2)
             preds_size_2 = torch.IntTensor([preds_2.size(1)] * batch_size)
             preds_2 = preds_2.log_softmax(2).permute(1, 0, 2)
-
-            ocrCost = 0.5*(ocrCriterion(preds_1, text_1, preds_size_1, length_1) + ocrCriterion(preds_2, text_2, preds_size_2, length_2))
+            ocrCost_1 = ocrCriterion(preds_1, text_1, preds_size_1, length_1)
+            ocrCost_2 = ocrCriterion(preds_2, text_2, preds_size_2, length_2)
+            # ocrCost = 0.5*( ocrCost_1 + ocrCost_2 )
 
         else:
             if not opt.ocrFixed:
@@ -312,13 +329,15 @@ def train(opt):
             preds_2 = ocrModel(images_recon_2, text_2[:, :-1])  # align with Attention.forward
             target_2 = text_2[:, 1:]  # without [GO] Symbol
 
-            ocrCost = 0.5*(ocrCriterion(preds_1.view(-1, preds_1.shape[-1]), target_1.contiguous().view(-1))+ocrCriterion(preds_2.view(-1, preds_2.shape[-1]), target_2.contiguous().view(-1)))
+            ocrCost_1 = ocrCriterion(preds_1.view(-1, preds_1.shape[-1]), target_1.contiguous().view(-1))
+            ocrCost_2 = ocrCriterion(preds_2.view(-1, preds_2.shape[-1]), target_2.contiguous().view(-1))
+            # ocrCost = 0.5*(ocrCost_1+ocrCost_2)
         
         if not opt.ocrFixed:
             #training OCR
             ocrModel.zero_grad()
             ocrCost_train.backward()
-            torch.nn.utils.clip_grad_norm_(ocrModel.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
+            # torch.nn.utils.clip_grad_norm_(ocrModel.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
             ocr_optimizer.step()
             #if ocr is fixed; ignore this loss
             loss_avg_ocr.add(ocrCost_train)
@@ -330,11 +349,11 @@ def train(opt):
         disCost = opt.disWeight*0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
         disModel.zero_grad()
         disCost.backward()
-        torch.nn.utils.clip_grad_norm_(disModel.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
+        # torch.nn.utils.clip_grad_norm_(disModel.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
         dis_optimizer.step()
         loss_avg_dis.add(disCost)
         
-        #[Style Encoder] + [Word Generator] update
+        # #[Style Encoder] + [Word Generator] update
         #Adversarial loss
         disGenCost = 0.5*(disModel.module.calc_gen_loss(images_recon_1)+disModel.module.calc_gen_loss(images_recon_2))
 
@@ -342,7 +361,13 @@ def train(opt):
         recCost = recCriterion(images_recon_1,image)
 
         #Pair style reconstruction loss
-        styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style)
+        if opt.styleDetach:
+            styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style.detach())
+        else:
+            styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style)
+
+        #OCR Content cost
+        ocrCost = 0.5*(ocrCost_1+ocrCost_2)
 
         cost = opt.ocrWeight*ocrCost + opt.reconWeight*recCost + opt.disWeight*disGenCost + opt.styleReconWeight*styleRecCost
 
@@ -350,10 +375,16 @@ def train(opt):
         ocrModel.zero_grad()
         disModel.zero_grad()
         cost.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
         optimizer.step()
         loss_avg.add(cost)
 
+        #Individual losses
+        loss_avg_ocrRecon_1.add(opt.ocrWeight*0.5*ocrCost_1)
+        loss_avg_ocrRecon_2.add(opt.ocrWeight*0.5*ocrCost_2)
+        loss_avg_gen.add(opt.disWeight*disGenCost)
+        loss_avg_imgRecon.add(opt.reconWeight*recCost)
+        loss_avg_styRecon.add(opt.styleReconWeight*styleRecCost)
 
         # validation part
         if (iteration + 1) % opt.valInterval == 0 or iteration == 0: # To see training progress, we also conduct validation when 'iteration == 0' 
@@ -362,7 +393,7 @@ def train(opt):
             os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'trainImages',str(iteration)), exist_ok=True)
             for trImgCntr in range(batch_size):
                 try:
-                    save_image(tensor2im(image[trImgCntr].detach()),os.path.join(opt.exp_dir,opt.exp_name,'trainImages',str(iteration),str(trImgCntr)+'_input_'+labels_1[trImgCntr]+'.png'))
+                    save_image(tensor2im(image[trImgCntr].detach()),os.path.join(opt.exp_dir,opt.exp_name,'trainImages',str(iteration),str(trImgCntr)+'_input_'+labels_gt[trImgCntr]+'.png'))
                     save_image(tensor2im(images_recon_1[trImgCntr].detach()),os.path.join(opt.exp_dir,opt.exp_name,'trainImages',str(iteration),str(trImgCntr)+'_recon_'+labels_1[trImgCntr]+'.png'))
                     save_image(tensor2im(images_recon_2[trImgCntr].detach()),os.path.join(opt.exp_dir,opt.exp_name,'trainImages',str(iteration),str(trImgCntr)+'_pair_'+labels_2[trImgCntr]+'.png'))
                 except:
@@ -373,14 +404,26 @@ def train(opt):
             
             with open(os.path.join(opt.exp_dir,opt.exp_name,'log_train.txt'), 'a') as log:
                 model.eval()
-                ocrModel.eval()
+                ocrModel.module.Transformation.eval()
+                ocrModel.module.FeatureExtraction.eval()
+                ocrModel.module.AdaptiveAvgPool.eval()
+                ocrModel.module.SequenceModeling.eval()
+                ocrModel.module.Prediction.eval()
                 disModel.eval()
                 
                 with torch.no_grad():                    
                     valid_loss, current_accuracy, current_norm_ED, preds, confidence_score, labels, infer_time, length_of_data = validation_synth_lrw_res(
                         iteration, model, ocrModel, disModel, recCriterion, styleRecCriterion, ocrCriterion, valid_loader, converter, opt)
                 model.train()
-                ocrModel.train()
+                if not opt.ocrFixed:
+                    ocrModel.train()
+                else:
+                #     ocrModel.module.Transformation.eval()
+                #     ocrModel.module.FeatureExtraction.eval()
+                #     ocrModel.module.AdaptiveAvgPool.eval()
+                    ocrModel.module.SequenceModeling.train()
+                #     ocrModel.module.Prediction.eval()
+
                 disModel.train()
 
                 # training loss and validation loss
@@ -392,17 +435,33 @@ def train(opt):
                 current_model_log_2 = f'{"Current_accuracy_pair":17s}: {current_accuracy[2]:0.3f}, {"Current_norm_ED_pair":17s}: {current_norm_ED[2]:0.2f}'
                 
                 #plotting
-                # pdb.set_trace()
                 lib.plot.plot(os.path.join(plotDir,'Train-OCR-Loss'), loss_avg_ocr.val().item())
                 lib.plot.plot(os.path.join(plotDir,'Train-Synth-Loss'), loss_avg.val().item())
                 lib.plot.plot(os.path.join(plotDir,'Train-Dis-Loss'), loss_avg_dis.val().item())
+                
+                lib.plot.plot(os.path.join(plotDir,'Train-OCR-Recon1-Loss'), loss_avg_ocrRecon_1.val().item())
+                lib.plot.plot(os.path.join(plotDir,'Train-OCR-Recon2-Loss'), loss_avg_ocrRecon_2.val().item())
+                lib.plot.plot(os.path.join(plotDir,'Train-Gen-Loss'), loss_avg_gen.val().item())
+                lib.plot.plot(os.path.join(plotDir,'Train-ImgRecon1-Loss'), loss_avg_imgRecon.val().item())
+                lib.plot.plot(os.path.join(plotDir,'Train-StyRecon2-Loss'), loss_avg_styRecon.val().item())
+
                 lib.plot.plot(os.path.join(plotDir,'Valid-OCR-Loss'), valid_loss[0].item())
                 lib.plot.plot(os.path.join(plotDir,'Valid-Synth-Loss'), valid_loss[1].item())
                 lib.plot.plot(os.path.join(plotDir,'Valid-Dis-Loss'), valid_loss[2].item())
 
+                lib.plot.plot(os.path.join(plotDir,'Valid-OCR-Recon1-Loss'), valid_loss[3].item())
+                lib.plot.plot(os.path.join(plotDir,'Valid-OCR-Recon2-Loss'), valid_loss[4].item())
+                lib.plot.plot(os.path.join(plotDir,'Valid-Gen-Loss'), valid_loss[5].item())
+                lib.plot.plot(os.path.join(plotDir,'Valid-ImgRecon1-Loss'), valid_loss[6].item())
+                lib.plot.plot(os.path.join(plotDir,'Valid-StyRecon2-Loss'), valid_loss[7].item())
+
                 lib.plot.plot(os.path.join(plotDir,'Orig-OCR-WordAccuracy'), current_accuracy[0])
                 lib.plot.plot(os.path.join(plotDir,'Recon-OCR-WordAccuracy'), current_accuracy[1])
                 lib.plot.plot(os.path.join(plotDir,'Pair-OCR-WordAccuracy'), current_accuracy[2])
+
+                lib.plot.plot(os.path.join(plotDir,'Orig-OCR-CharAccuracy'), current_norm_ED[0])
+                lib.plot.plot(os.path.join(plotDir,'Recon-OCR-CharAccuracy'), current_norm_ED[1])
+                lib.plot.plot(os.path.join(plotDir,'Pair-OCR-CharAccuracy'), current_norm_ED[2])
                 
 
                 # keep best accuracy model (on valid dataset)
@@ -417,7 +476,6 @@ def train(opt):
                 best_model_log = f'{"Best_accuracy_Recon":17s}: {best_accuracy:0.3f}, {"Best_norm_ED_Recon":17s}: {best_norm_ED:0.2f}'
 
                 # keep best accuracy model (on valid dataset)
-                # if not opt.ocrFixed:
                 if current_accuracy[0] > best_accuracy_ocr:
                     best_accuracy_ocr = current_accuracy[0]
                     if not opt.ocrFixed:
@@ -458,6 +516,12 @@ def train(opt):
                 loss_avg_ocr.reset()
                 loss_avg.reset()
                 loss_avg_dis.reset()
+
+                loss_avg_ocrRecon_1.reset()
+                loss_avg_ocrRecon_2.reset()
+                loss_avg_gen.reset()
+                loss_avg_imgRecon.reset()
+                loss_avg_styRecon.reset()
 
             lib.plot.flush()
 
@@ -508,8 +572,13 @@ if __name__ == '__main__':
     parser.add_argument('--total_data_usage_ratio', type=str, default='1.0',
                         help='total data usage ratio, this ratio is multiplied to total number of data.')
     parser.add_argument('--batch_max_length', type=int, default=24, help='maximum-label-length')
+    parser.add_argument('--batch_min_length', type=int, default=1, help='minimum-label-length')
+    parser.add_argument('--fixedString', action='store_true', help='use fixed length data')
+    parser.add_argument('--batch_exact_length', type=int, default=5, help='exact-label-length')
     parser.add_argument('--imgH', type=int, default=48, help='the height of the input image')
     parser.add_argument('--imgW', type=int, default=288, help='the width of the input image')
+    parser.add_argument('--ocr_imgH', type=int, default=32, help='the height of the input image')
+    parser.add_argument('--ocr_imgW', type=int, default=100, help='the width of the input image')
     parser.add_argument('--rgb', action='store_true', help='use rgb input')
     parser.add_argument('--character', type=str,
                         default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
@@ -527,6 +596,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_fiducial', type=int, default=20, help='number of fiducial points of TPS-STN')
     parser.add_argument('--input_channel', type=int, default=1,
                         help='the number of input channel of Feature extractor')
+    parser.add_argument('--ocr_input_channel', type=int, default=1,
+                        help='the number of input channel of Feature extractor')
     parser.add_argument('--output_channel', type=int, default=512,
                         help='the number of output channel of Feature extractor')
     parser.add_argument('--hidden_size', type=int, default=256, help='the size of the LSTM hidden state')
@@ -536,6 +607,7 @@ if __name__ == '__main__':
     parser.add_argument('--reconWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--disWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--styleReconWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--styleDetach', action='store_true', help='whether to detach style')
 
 
     parser.add_argument('--debugFlag', action='store_true', help='for debugging')

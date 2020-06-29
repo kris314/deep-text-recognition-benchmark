@@ -39,21 +39,21 @@ class Model(nn.Module):
         """ Transformation """
         if opt.Transformation == 'TPS':
             self.Transformation = TPS_SpatialTransformerNetwork(
-                F=opt.num_fiducial, I_size=(opt.imgH, opt.imgW), I_r_size=(opt.imgH, opt.imgW), I_channel_num=opt.input_channel)
+                F=opt.num_fiducial, I_size=(opt.ocr_imgH, opt.ocr_imgW), I_r_size=(opt.ocr_imgH, opt.ocr_imgW), I_channel_num=opt.ocr_input_channel)
         else:
             print('No Transformation module specified')
 
         """ FeatureExtraction """
         if opt.FeatureExtraction == 'VGG':
-            self.FeatureExtraction = VGG_FeatureExtractor(opt.input_channel, opt.output_channel)
+            self.FeatureExtraction = VGG_FeatureExtractor(opt.ocr_input_channel, opt.output_channel)
         elif opt.FeatureExtraction == 'RCNN':
-            self.FeatureExtraction = RCNN_FeatureExtractor(opt.input_channel, opt.output_channel)
+            self.FeatureExtraction = RCNN_FeatureExtractor(opt.ocr_input_channel, opt.output_channel)
         elif opt.FeatureExtraction == 'ResNet':
-            self.FeatureExtraction = ResNet_FeatureExtractor(opt.input_channel, opt.output_channel)
+            self.FeatureExtraction = ResNet_FeatureExtractor(opt.ocr_input_channel, opt.output_channel)
         else:
             raise Exception('No FeatureExtraction module specified')
-        self.FeatureExtraction_output = opt.output_channel  # int(imgH/16-1) * 512
-        self.AdaptiveAvgPool = nn.AdaptiveAvgPool2d((None, 1))  # Transform final (imgH/16-1) -> 1
+        self.FeatureExtraction_output = opt.output_channel  # int(ocr_imgH/16-1) * 512
+        self.AdaptiveAvgPool = nn.AdaptiveAvgPool2d((None, 1))  # Transform final (ocr_imgH/16-1) -> 1
 
         """ Sequence modeling"""
         if opt.SequenceModeling == 'BiLSTM':
@@ -75,6 +75,13 @@ class Model(nn.Module):
 
     def forward(self, input, text, is_train=True):
         
+        if self.opt.ocr_input_channel == 1 and self.opt.input_channel == 3:
+            #rgb2gray conversion
+            input = (input[:,0,:,:]*0.21+input[:,1,:,:]*0.72+input[:,1,:,:]*0.07).unsqueeze(1)
+        
+        if input.shape[2]!=self.opt.ocr_imgH or input.shape[3]!=self.opt.ocr_imgW:
+            input = F.interpolate(input,(self.opt.ocr_imgH,self.opt.ocr_imgW),mode='bicubic', align_corners=False)
+
         """ Transformation stage """
         if not self.stages['Trans'] == "None":
             input = self.Transformation(input)
@@ -142,7 +149,6 @@ class AdaINGen(nn.Module):
 
     def forward(self, images, labels_1, labels_2, styleFlag=False):
         # reconstruct an image
-        
         style = self.enc_style(images)
 
         if styleFlag:

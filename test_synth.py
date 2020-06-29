@@ -795,7 +795,7 @@ def validation_synth_lrw(iterCntr, synthModel, ocrModel, disModel, recCriterion,
 def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriterion, styleRecCriterion, ocrCriterion, evaluation_loader, converter, opt):
     """ validation or evaluation """
     os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
-
+    random.seed(1024)
     n_correct_ocr = 0
     norm_ED_ocr = 0
 
@@ -810,18 +810,26 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
     valid_loss_avg = Averager()
     valid_loss_avg_dis = Averager()
 
+    valid_loss_avg_ocrRecon_1 = Averager()
+    valid_loss_avg_ocrRecon_2 = Averager()
+    valid_loss_avg_gen = Averager()
+    valid_loss_avg_imgRecon = Averager()
+    valid_loss_avg_styRecon = Averager()
+
     lexicons=[]
     out_of_char = f'[^{opt.character}]'
     #read lexicons file
     with open(opt.lexFile,'r') as lexF:
         for line in lexF:
             lexWord = line[:-1]
-            if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())):
+            if opt.fixedString and len(lexWord)!=opt.batch_exact_length:
+                continue
+            if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())) and len(lexWord) >= opt.batch_min_length:
                 lexicons.append(lexWord)
 
     for i, (image_tensors_all, labels_1_all) in enumerate(evaluation_loader):
         # print(i)
-        if opt.debugFlag and i>2:
+        if opt.debugFlag and i>0:
             break
         
         disCnt = int(image_tensors_all.size(0)/2)
@@ -867,16 +875,17 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
         text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
         
         start_time = time.time()
+        
         images_recon_1, images_recon_2, style = synthModel(image, text_for_loss_1, text_for_loss_2)
 
-        #Save random reconstructed image and write its gt
-        rIdx = random.randint(0,batch_size-1)
-        try:
-            save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_input_'+labels_gt[rIdx]+'.png'))
-            save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_recon_'+labels_1[rIdx]+'.png'))
-            save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_pair_'+labels_2[rIdx]+'.png'))
-        except:
-            print('Warning while saving validation image')
+        # #Save random reconstructed image and write its gt
+        # rIdx = random.randint(0,batch_size-1)
+        # try:
+        #     save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_input_'+labels_gt[rIdx]+'.png'))
+        #     save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_recon_'+labels_1[rIdx]+'.png'))
+        #     save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_pair_'+labels_2[rIdx]+'.png'))
+        # except:
+        #     print('Warning while saving validation image')
         
         
         if 'CTC' in opt.Prediction:
@@ -906,12 +915,12 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
             # if not opt.ocrFixed:
             #ocr evaluations with orig image
             preds_ocr = ocrModel(image, text_for_pred, is_train=False)
-            preds_ocr = preds_ocr[:, :text_for_loss_1.shape[1] - 1, :]
-            target = text_for_loss_1[:, 1:]  # without [GO] Symbol
-            ocrCost_ocr = ocrCriterion(preds_ocr.contiguous().view(-1, preds_ocr.shape[-1]), target.contiguous().view(-1))
+            
+            preds_ocr = preds_ocr[:, :text_for_loss_ocr.shape[1] - 1, :]
+            target_ocr = text_for_loss_ocr[:, 1:]  # without [GO] Symbol
+            ocrCost_ocr = ocrCriterion(preds_ocr.contiguous().view(-1, preds_ocr.shape[-1]), target_ocr.contiguous().view(-1))
             _, preds_index = preds_ocr.max(2)
             preds_str_ocr = converter.decode(preds_index, length_for_pred)
-            # pdb.set_trace()
             # labels_1 = converter.decode(text_for_loss_1[:, 1:], length_for_loss_1)
             # else:
             #     ocrCost_ocr = torch.tensor(0.0)
@@ -942,6 +951,13 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
         valid_loss_avg_ocr.add(ocrCost_ocr)
         valid_loss_avg.add(opt.ocrWeight*(0.5*(ocrCost_1+ocrCost_2))+opt.reconWeight*recCost+opt.disWeight*disGenCost+opt.styleReconWeight*styleRecCost)
         valid_loss_avg_dis.add(opt.disWeight*disCost)
+        
+        #fine grained losses
+        valid_loss_avg_ocrRecon_1.add(opt.ocrWeight*(0.5*(ocrCost_1)))
+        valid_loss_avg_ocrRecon_2.add(opt.ocrWeight*(0.5*(ocrCost_2)))
+        valid_loss_avg_gen.add(opt.disWeight*disGenCost)
+        valid_loss_avg_imgRecon.add(opt.reconWeight*recCost)
+        valid_loss_avg_styRecon.add(opt.styleReconWeight*styleRecCost)
 
         # if not opt.ocrFixed:
         # calculate accuracy & confidence score
@@ -987,8 +1003,6 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
             #     pred = re.sub(out_of_alphanumeric_case_insensitve, '', pred)
             #     gt = re.sub(out_of_alphanumeric_case_insensitve, '', gt)
 
-            # if not opt.ocrFixed:
-            # pdb.set_trace()
             if pred_ocr == gt_ocr:
                 n_correct_ocr += 1
             # else:
@@ -1054,6 +1068,28 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
             # print(pred, gt, pred==gt, confidence_score)
             
             # zCntr+=1
+        #Save random reconstructed image and write its gt
+        rIdx = random.randint(0,batch_size-1)
+        if 'Attn' in opt.Prediction:
+            r_pred_EOS = preds_str_ocr[rIdx].find('[s]')
+            r_pred_ocr = preds_str_ocr[rIdx][:r_pred_EOS]
+
+            r_pred_1_EOS = preds_str_1[rIdx].find('[s]')
+            r_pred_1 = preds_str_1[rIdx][:r_pred_1_EOS]
+
+            r_pred_2_EOS = preds_str_2[rIdx].find('[s]')
+            r_pred_2 = preds_str_2[rIdx][:r_pred_2_EOS]
+        else:
+            r_pred_ocr = preds_str_ocr[rIdx]
+            r_pred_1 = preds_str_1[rIdx]
+            r_pred_2 = preds_str_2[rIdx]
+        
+        try:
+            save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_input_'+labels_gt[rIdx]+'_'+r_pred_ocr+'.png'))
+            save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_recon_'+labels_1[rIdx]+'_'+r_pred_1+'.png'))
+            save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_pair_'+labels_2[rIdx]+'_'+r_pred_2+'.png'))
+        except:
+            print('Warning while saving validation image')
 
     accuracy_ocr = n_correct_ocr / float(length_of_data) * 100
     norm_ED_ocr = norm_ED_ocr / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
@@ -1063,8 +1099,10 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
 
     accuracy_2 = n_correct_2 / float(length_of_data) * 100
     norm_ED_2 = norm_ED_2 / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
+    
+    random.seed()
 
-    return [valid_loss_avg_ocr.val(), valid_loss_avg.val(), valid_loss_avg_dis.val()], [accuracy_ocr,accuracy_1,accuracy_2], [norm_ED_ocr,norm_ED_1,norm_ED_2], [preds_str_ocr, preds_str_1,preds_str_2], [confidence_score_list_ocr,confidence_score_list_1,confidence_score_list_2], [labels_gt,labels_1,labels_2], infer_time, length_of_data
+    return [valid_loss_avg_ocr.val(), valid_loss_avg.val(), valid_loss_avg_dis.val(), valid_loss_avg_ocrRecon_1.val(),valid_loss_avg_ocrRecon_2.val(), valid_loss_avg_gen.val(), valid_loss_avg_imgRecon.val(), valid_loss_avg_styRecon.val()], [accuracy_ocr,accuracy_1,accuracy_2], [norm_ED_ocr,norm_ED_1,norm_ED_2], [preds_str_ocr, preds_str_1,preds_str_2], [confidence_score_list_ocr,confidence_score_list_1,confidence_score_list_2], [labels_gt,labels_1,labels_2], infer_time, length_of_data
 
 def test(opt):
     """ model configuration """
