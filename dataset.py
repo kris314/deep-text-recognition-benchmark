@@ -161,6 +161,7 @@ class LmdbDataset(Dataset):
         with self.env.begin(write=False) as txn:
             nSamples = int(txn.get('num-samples'.encode()))
             self.nSamples = nSamples
+            print('nSamples:::::::::::::',nSamples)
 
             if self.opt.data_filtering_off:
                 # for fast check or benchmark evaluation with no filtering

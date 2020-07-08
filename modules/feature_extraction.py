@@ -31,6 +31,7 @@ class VGG_FeatureExtractor(nn.Module):
         return self.ConvNet(input)
 
 
+
 class RCNN_FeatureExtractor(nn.Module):
     """ FeatureExtractor of GRCNN (https://papers.nips.cc/paper/6637-gated-recurrent-convolution-neural-network-for-ocr.pdf) """
 

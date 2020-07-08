@@ -14,12 +14,12 @@ from nltk.metrics.distance import edit_distance
 
 from utils import CTCLabelConverter, AttnLabelConverter, Averager
 from dataset import hierarchical_dataset, AlignCollate, tensor2im, save_image
-from model import Model
+from model import Model, AdaINGen, MsImageDis
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 import pdb
 
-def benchmark_all_eval(model, criterion, converter, opt, calculate_infer_time=False):
+def benchmark_all_eval(synthModel, ocrModel, recCriterion, styleRecCriterion, ocrCriterion, converter, opt, calculate_infer_time=False):
     """ evaluation with 10 benchmark evaluation datasets """
     # The evaluation datasets, dataset order is same with Table 1 in our paper.
     eval_data_list = ['IIIT5k_3000', 'SVT', 'IC03_860', 'IC03_867', 'IC13_857',
@@ -833,6 +833,7 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
             break
         
         disCnt = int(image_tensors_all.size(0)/2)
+        
         image_tensors, image_tensors_real, labels_gt = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt]
         image = image_tensors.to(device)
         image_real = image_tensors_real.to(device)
@@ -875,8 +876,12 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
         text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
         
         start_time = time.time()
+        if image.shape[0] == 0:
+            continue
         
         images_recon_1, images_recon_2, style = synthModel(image, text_for_loss_1, text_for_loss_2)
+        
+        
 
         # #Save random reconstructed image and write its gt
         # rIdx = random.randint(0,batch_size-1)
@@ -942,10 +947,21 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
 
         forward_time = time.time() - start_time
 
-        disCost = 0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
-        disGenCost = 0.5*(disModel.module.calc_gen_loss(images_recon_1)+disModel.module.calc_gen_loss(images_recon_2))
+        if disModel == None:
+            disCost = torch.tensor(0.0)
+            disGenCost = torch.tensor(0.0)
+        else:
+            if opt.gan_type == 'wgan':
+                disCost = torch.tensor(0.0)
+            else:
+                disCost = 0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
+            disGenCost = 0.5*(disModel.module.calc_gen_loss(images_recon_1)+disModel.module.calc_gen_loss(images_recon_2))
         recCost = recCriterion(images_recon_1,image)
-        styleRecCost = styleRecCriterion(synthModel(images_recon_2, None, None, styleFlag=True), style)
+        
+        if opt.styleReconWeight == 0.0:
+            styleRecCost = torch.tensor(0.0)
+        else:
+            styleRecCost = styleRecCriterion(synthModel(images_recon_2, None, None, styleFlag=True), style)
 
         infer_time += forward_time
         valid_loss_avg_ocr.add(ocrCost_ocr)
@@ -1069,27 +1085,31 @@ def validation_synth_lrw_res(iterCntr, synthModel, ocrModel, disModel, recCriter
             
             # zCntr+=1
         #Save random reconstructed image and write its gt
-        rIdx = random.randint(0,batch_size-1)
-        if 'Attn' in opt.Prediction:
-            r_pred_EOS = preds_str_ocr[rIdx].find('[s]')
-            r_pred_ocr = preds_str_ocr[rIdx][:r_pred_EOS]
-
-            r_pred_1_EOS = preds_str_1[rIdx].find('[s]')
-            r_pred_1 = preds_str_1[rIdx][:r_pred_1_EOS]
-
-            r_pred_2_EOS = preds_str_2[rIdx].find('[s]')
-            r_pred_2 = preds_str_2[rIdx][:r_pred_2_EOS]
+        if opt.testFlag:
+            randomSaveIdx = list(range(0,batch_size))
         else:
-            r_pred_ocr = preds_str_ocr[rIdx]
-            r_pred_1 = preds_str_1[rIdx]
-            r_pred_2 = preds_str_2[rIdx]
-        
-        try:
-            save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_input_'+labels_gt[rIdx]+'_'+r_pred_ocr+'.png'))
-            save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_recon_'+labels_1[rIdx]+'_'+r_pred_1+'.png'))
-            save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_pair_'+labels_2[rIdx]+'_'+r_pred_2+'.png'))
-        except:
-            print('Warning while saving validation image')
+            randomSaveIdx = [random.randint(0,batch_size-1)]
+        for rIdx in randomSaveIdx:
+            if 'Attn' in opt.Prediction:
+                r_pred_EOS = preds_str_ocr[rIdx].find('[s]')
+                r_pred_ocr = preds_str_ocr[rIdx][:r_pred_EOS]
+
+                r_pred_1_EOS = preds_str_1[rIdx].find('[s]')
+                r_pred_1 = preds_str_1[rIdx][:r_pred_1_EOS]
+
+                r_pred_2_EOS = preds_str_2[rIdx].find('[s]')
+                r_pred_2 = preds_str_2[rIdx][:r_pred_2_EOS]
+            else:
+                r_pred_ocr = preds_str_ocr[rIdx]
+                r_pred_1 = preds_str_1[rIdx]
+                r_pred_2 = preds_str_2[rIdx]
+            
+            try:
+                save_image(tensor2im(image[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_input_'+labels_gt[rIdx]+'_'+r_pred_ocr+'.png'))
+                save_image(tensor2im(images_recon_1[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_recon_'+labels_1[rIdx]+'_'+r_pred_1+'.png'))
+                save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_pair_'+labels_2[rIdx]+'_'+r_pred_2+'.png'))
+            except:
+                print('Warning while saving validation image')
 
     accuracy_ocr = n_correct_ocr / float(length_of_data) * 100
     norm_ED_ocr = norm_ED_ocr / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
@@ -1114,35 +1134,56 @@ def test(opt):
 
     if opt.rgb:
         opt.input_channel = 3
-    model = Model(opt)
+    
+    model = AdaINGen(opt)
+    ocrModel = Model(opt)
+
     print('model input parameters', opt.imgH, opt.imgW, opt.num_fiducial, opt.input_channel, opt.output_channel,
           opt.hidden_size, opt.num_class, opt.batch_max_length, opt.Transformation, opt.FeatureExtraction,
           opt.SequenceModeling, opt.Prediction)
+    
     model = torch.nn.DataParallel(model).to(device)
+    ocrModel = torch.nn.DataParallel(ocrModel).to(device)
 
     # load model
-    print('loading pretrained model from %s' % opt.saved_model)
-    model.load_state_dict(torch.load(opt.saved_model, map_location=device))
-    opt.exp_name = '_'.join(opt.saved_model.split('/')[1:])
-    # print(model)
+    print('loading pretrained ocr model from %s' % opt.saved_ocr_model)
+    ocrModel.load_state_dict(torch.load(opt.saved_ocr_model, map_location=device))
+
+    print('loading pretrained synth model from %s' % opt.saved_synth_model)
+    model.load_state_dict(torch.load(opt.saved_synth_model, map_location=device))
+
+    # opt.exp_name = '_'.join(opt.saved_model.split('/')[1:])
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name), exist_ok=True)
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'evalImages'), exist_ok=True)
+
+    print(model)
+    print(ocrModel)
+
+    
+
 
     """ keep evaluation model and result logs """
-    os.makedirs(f'./result/{opt.exp_name}', exist_ok=True)
-    os.system(f'cp {opt.saved_model} ./result/{opt.exp_name}/')
+    # os.makedirs(f'./result/{opt.exp_name}', exist_ok=True)
+    # os.system(f'cp {opt.saved_model} ./result/{opt.exp_name}/')
 
     """ setup loss """
     if 'CTC' in opt.Prediction:
-        criterion = torch.nn.CTCLoss(zero_infinity=True).to(device)
+        ocrCriterion = torch.nn.CTCLoss(zero_infinity=True).to(device)
     else:
-        criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)  # ignore [GO] token = ignore index 0
+        ocrCriterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)  # ignore [GO] token = ignore index 0
+
+    recCriterion = torch.nn.L1Loss()
+    styleRecCriterion = torch.nn.L1Loss()
 
     """ evaluation """
     model.eval()
+    ocrModel.eval()
+
     with torch.no_grad():
         if opt.benchmark_all_eval:  # evaluation with 10 benchmark evaluation datasets
-            benchmark_all_eval(model, criterion, converter, opt)
+            benchmark_all_eval(model, ocrModel, recCriterion, styleRecCriterion, ocrCriterion, converter, opt)
         else:
-            log = open(f'./result/{opt.exp_name}/log_evaluation.txt', 'a')
+            # log = open(f'./result/{opt.exp_name}/log_evaluation.txt', 'a')
             AlignCollate_evaluation = AlignCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
             eval_data, eval_data_log = hierarchical_dataset(root=opt.eval_data, opt=opt)
             evaluation_loader = torch.utils.data.DataLoader(
@@ -1150,30 +1191,38 @@ def test(opt):
                 shuffle=False,
                 num_workers=int(opt.workers),
                 collate_fn=AlignCollate_evaluation, pin_memory=True)
-            _, accuracy_by_best_model, _, _, _, _, _, _ = validation(
-                model, criterion, evaluation_loader, converter, opt)
-            log.write(eval_data_log)
-            print(f'{accuracy_by_best_model:0.3f}')
-            log.write(f'{accuracy_by_best_model:0.3f}\n')
-            log.close()
+            validation_synth_lrw_res(-1,model, ocrModel, None, recCriterion, styleRecCriterion, ocrCriterion, evaluation_loader, converter, opt)
+            # log.write(eval_data_log)
+            # print(f'{accuracy_by_best_model:0.3f}')
+            # log.write(f'{accuracy_by_best_model:0.3f}\n')
+            # log.close()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--exp_dir', default='/checkpoint/pkrishnan/experiments/scribe/Exp06/', help='Where to store logs and models')
+    parser.add_argument('--exp_name', default='debug', help='Where to store logs and models')
     parser.add_argument('--eval_data', required=True, help='path to evaluation dataset')
     parser.add_argument('--benchmark_all_eval', action='store_true', help='evaluate 10 benchmark evaluation datasets')
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
     parser.add_argument('--batch_size', type=int, default=192, help='input batch size')
-    parser.add_argument('--saved_model', required=True, help="path to saved_model to evaluation")
+    parser.add_argument('--saved_ocr_model', default='', help="path to model to continue training")
+    parser.add_argument('--saved_synth_model', default='', help="path to model to continue training")
     """ Data processing """
     parser.add_argument('--batch_max_length', type=int, default=25, help='maximum-label-length')
+    parser.add_argument('--batch_min_length', type=int, default=1, help='minimum-label-length')
+    parser.add_argument('--fixedString', action='store_true', help='use fixed length data')
+    parser.add_argument('--batch_exact_length', type=int, default=5, help='exact-label-length')
     parser.add_argument('--imgH', type=int, default=32, help='the height of the input image')
     parser.add_argument('--imgW', type=int, default=100, help='the width of the input image')
+    parser.add_argument('--ocr_imgH', type=int, default=32, help='the height of the input image')
+    parser.add_argument('--ocr_imgW', type=int, default=100, help='the width of the input image')
     parser.add_argument('--rgb', action='store_true', help='use rgb input')
     parser.add_argument('--character', type=str, default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
     parser.add_argument('--sensitive', action='store_true', help='for sensitive character mode')
     parser.add_argument('--PAD', action='store_true', help='whether to keep ratio then pad for image resize')
     parser.add_argument('--data_filtering_off', action='store_true', help='for data_filtering_off mode')
+    parser.add_argument('--lexFile', default='/checkpoint/pkrishnan/datasets/vocab/english-words.txt', help='unqiue words in language')
     """ Model Architecture """
     parser.add_argument('--Transformation', type=str, required=True, help='Transformation stage. None|TPS')
     parser.add_argument('--FeatureExtraction', type=str, required=True, help='FeatureExtraction stage. VGG|RCNN|ResNet')
@@ -1181,9 +1230,21 @@ if __name__ == '__main__':
     parser.add_argument('--Prediction', type=str, required=True, help='Prediction stage. CTC|Attn')
     parser.add_argument('--num_fiducial', type=int, default=20, help='number of fiducial points of TPS-STN')
     parser.add_argument('--input_channel', type=int, default=1, help='the number of input channel of Feature extractor')
+    parser.add_argument('--ocr_input_channel', type=int, default=1,
+                        help='the number of input channel of Feature extractor')
     parser.add_argument('--output_channel', type=int, default=512,
                         help='the number of output channel of Feature extractor')
     parser.add_argument('--hidden_size', type=int, default=256, help='the size of the LSTM hidden state')
+    parser.add_argument('--char_embed_size', type=int, default=60, help='character embedding for content encoder')
+
+    parser.add_argument('--ocrFixed', action='store_true', help='true: for pretrined OCR and fixed weights')
+    parser.add_argument('--ocrWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--reconWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--disWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--styleReconWeight', type=float, default=1.0, help='weights for loss')
+
+    parser.add_argument('--debugFlag', action='store_true', help='for debugging')
+    parser.add_argument('--testFlag', action='store_true', help='for testing')
 
     opt = parser.parse_args()
 

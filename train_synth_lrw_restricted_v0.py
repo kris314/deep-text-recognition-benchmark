@@ -4,25 +4,30 @@ import time
 import random
 import string
 import argparse
+import glob
 
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.init as init
 import torch.optim as optim
 import torch.utils.data
+from torch.optim import lr_scheduler
 import numpy as np
 
 import pdb
 
 from utils import CTCLabelConverter, AttnLabelConverter, Averager
 from dataset import hierarchical_dataset, AlignCollate, Batch_Balanced_Dataset, tensor2im, save_image
-from model import Model, AdaINGen, MsImageDis
+from model import Model, AdaINGen, MsImageDisV1
 from test_synth import validation, validation_synth, validation_synth_adv, validation_synth_lrw, validation_synth_lrw_res
 
 import tflib as lib
 import tflib.plot
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+
 
 
 def train(opt):
@@ -71,7 +76,7 @@ def train(opt):
     
     model = AdaINGen(opt)
     ocrModel = Model(opt)
-    disModel = MsImageDis(opt)
+    disModel = MsImageDisV1(opt)
     
     print('model input parameters', opt.imgH, opt.imgW, opt.num_fiducial, opt.input_channel, opt.output_channel,
           opt.hidden_size, opt.num_class, opt.batch_max_length, opt.Transformation, opt.FeatureExtraction,
@@ -112,8 +117,16 @@ def train(opt):
     disModel = torch.nn.DataParallel(disModel).to(device)
     disModel.train()
 
+    if opt.modelFolderFlag:
+        pdb.set_trace()
+        if len(glob.glob(os.path.join(opt.exp_dir,opt.exp_name,"iter_*_synth.pth")))>0:
+            opt.saved_synth_model = glob.glob(os.path.join(opt.exp_dir,opt.exp_name,"iter_*_synth.pth"))[-1]
+        
+        if len(glob.glob(os.path.join(opt.exp_dir,opt.exp_name,"iter_*_dis.pth")))>0:
+            opt.saved_dis_model = glob.glob(os.path.join(opt.exp_dir,opt.exp_name,"iter_*_dis.pth"))[-1]
+
     #loading pre-trained model
-    if opt.saved_ocr_model != '':
+    if opt.saved_ocr_model != '' and opt.saved_ocr_model != 'None':
         print(f'loading pretrained ocr model from {opt.saved_ocr_model}')
         if opt.FT:
             ocrModel.load_state_dict(torch.load(opt.saved_ocr_model), strict=False)
@@ -122,7 +135,7 @@ def train(opt):
     print("OCRModel:")
     print(ocrModel)
 
-    if opt.saved_synth_model != '':
+    if opt.saved_synth_model != '' and opt.saved_synth_model != 'None':
         print(f'loading pretrained synth model from {opt.saved_synth_model}')
         if opt.FT:
             model.load_state_dict(torch.load(opt.saved_synth_model), strict=False)
@@ -131,7 +144,7 @@ def train(opt):
     print("SynthModel:")
     print(model)
 
-    if opt.saved_dis_model != '':
+    if opt.saved_dis_model != '' and opt.saved_dis_model != 'None':
         print(f'loading pretrained discriminator model from {opt.saved_dis_model}')
         if opt.FT:
             disModel.load_state_dict(torch.load(opt.saved_dis_model), strict=False)
@@ -171,12 +184,13 @@ def train(opt):
     # [print(name, p.numel()) for name, p in filter(lambda p: p[1].requires_grad, model.named_parameters())]
 
     # setup optimizer
-    if opt.adam:
-        optimizer = optim.Adam(filtered_parameters, lr=opt.lr, betas=(opt.beta1, 0.999))
+    if opt.optim=='adam':
+        optimizer = optim.Adam(filtered_parameters, lr=opt.lr, betas=(opt.beta1, opt.beta2), weight_decay=opt.weight_decay)
     else:
-        optimizer = optim.Adadelta(filtered_parameters, lr=opt.lr, rho=opt.rho, eps=opt.eps)
+        optimizer = optim.Adadelta(filtered_parameters, lr=opt.lr, rho=opt.rho, eps=opt.eps, weight_decay=opt.weight_decay)
     print("SynthOptimizer:")
     print(optimizer)
+    
 
     #filter parameters for OCR training
     ocr_filtered_parameters = []
@@ -188,10 +202,10 @@ def train(opt):
 
 
     # setup optimizer
-    if opt.adam:
-        ocr_optimizer = optim.Adam(ocr_filtered_parameters, lr=opt.lr, betas=(opt.beta1, 0.999))
+    if opt.optim=='adam':
+        ocr_optimizer = optim.Adam(ocr_filtered_parameters, lr=opt.lr, betas=(opt.beta1, opt.beta2), weight_decay=opt.weight_decay)
     else:
-        ocr_optimizer = optim.Adadelta(ocr_filtered_parameters, lr=opt.lr, rho=opt.rho, eps=opt.eps)
+        ocr_optimizer = optim.Adadelta(ocr_filtered_parameters, lr=opt.lr, rho=opt.rho, eps=opt.eps, weight_decay=opt.weight_decay)
     print("OCROptimizer:")
     print(ocr_optimizer)
 
@@ -204,10 +218,10 @@ def train(opt):
     print('Dis Trainable params num : ', sum(dis_params_num))
 
     # setup optimizer
-    if opt.adam:
-        dis_optimizer = optim.Adam(dis_filtered_parameters, lr=opt.lr, betas=(opt.beta1, 0.999))
+    if opt.optim=='adam':
+        dis_optimizer = optim.Adam(dis_filtered_parameters, lr=opt.lr, betas=(opt.beta1, opt.beta2), weight_decay=opt.weight_decay)
     else:
-        dis_optimizer = optim.Adadelta(dis_filtered_parameters, lr=opt.lr, rho=opt.rho, eps=opt.eps)
+        dis_optimizer = optim.Adadelta(dis_filtered_parameters, lr=opt.lr, rho=opt.rho, eps=opt.eps, weight_decay=opt.weight_decay)
     print("DisOptimizer:")
     print(dis_optimizer)
     ##---------------------------------------##
@@ -224,12 +238,19 @@ def train(opt):
 
     """ start training """
     start_iter = 0
-    if opt.saved_synth_model != '':
+    pdb.set_trace()
+    if opt.saved_synth_model != '' and opt.saved_synth_model != 'None':
         try:
-            start_iter = int(opt.saved_synth_model.split('_')[-1].split('.')[0])
+            start_iter = int(opt.saved_synth_model.split('_')[-2].split('.')[0])
             print(f'continue to train, start_iter: {start_iter}')
         except:
             pass
+
+    
+    #get schedulers
+    scheduler = get_scheduler(optimizer,opt)
+    ocr_scheduler = get_scheduler(ocr_optimizer,opt)
+    dis_scheduler = get_scheduler(dis_optimizer,opt)
 
     start_time = time.time()
     best_accuracy = -1
@@ -237,10 +258,17 @@ def train(opt):
     best_accuracy_ocr = -1
     best_norm_ED_ocr = -1
     iteration = start_iter
-    # cntr=0
+    cntr=0
+
+
     while(True):
         # train part
         
+        if opt.lr_policy !="None":
+            scheduler.step()
+            ocr_scheduler.step()
+            dis_scheduler.step()
+            
         image_tensors_all, labels_1_all, labels_2_all = train_dataset.get_batch()
         
         # ## comment
@@ -250,7 +278,7 @@ def train(opt):
         # pdb.set_trace()
         # ###
         # print(cntr)
-        # cntr+=1
+        cntr+=1
         disCnt = int(image_tensors_all.size(0)/2)
         image_tensors, image_tensors_real, labels_gt, labels_2 = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt], labels_2_all[:disCnt]
 
@@ -323,10 +351,10 @@ def train(opt):
                 ocrCost_train = ocrCriterion(preds_ocr.view(-1, preds_ocr.shape[-1]), target_ocr.contiguous().view(-1))
 
             #content loss for reconstructed images
-            preds_1 = ocrModel(images_recon_1, text_1[:, :-1])  # align with Attention.forward
+            preds_1 = ocrModel(images_recon_1, text_1[:, :-1], is_train=False)  # align with Attention.forward
             target_1 = text_1[:, 1:]  # without [GO] Symbol
 
-            preds_2 = ocrModel(images_recon_2, text_2[:, :-1])  # align with Attention.forward
+            preds_2 = ocrModel(images_recon_2, text_2[:, :-1], is_train=False)  # align with Attention.forward
             target_2 = text_2[:, 1:]  # without [GO] Symbol
 
             ocrCost_1 = ocrCriterion(preds_1.view(-1, preds_1.shape[-1]), target_1.contiguous().view(-1))
@@ -346,8 +374,8 @@ def train(opt):
 
         
         #Domain discriminator: Dis update
-        disCost = opt.disWeight*0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
         disModel.zero_grad()
+        disCost = opt.disWeight*0.5*(disModel.module.calc_dis_loss(images_recon_1.detach(), image_real) + disModel.module.calc_dis_loss(images_recon_2.detach(), image))
         disCost.backward()
         # torch.nn.utils.clip_grad_norm_(disModel.parameters(), opt.grad_clip)  # gradient clipping with 5 (Default)
         dis_optimizer.step()
@@ -361,10 +389,13 @@ def train(opt):
         recCost = recCriterion(images_recon_1,image)
 
         #Pair style reconstruction loss
-        if opt.styleDetach:
-            styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style.detach())
+        if opt.styleReconWeight == 0.0:
+            styleRecCost = torch.tensor(0.0)
         else:
-            styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style)
+            if opt.styleDetach:
+                styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style.detach())
+            else:
+                styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style)
 
         #OCR Content cost
         ocrCost = 0.5*(ocrCost_1+ocrCost_2)
@@ -528,20 +559,31 @@ def train(opt):
         lib.plot.tick()
 
         # save model per 1e+5 iter.
-        if (iteration + 1) % 1e+5 == 0:
+        if (iteration) % 1e+5 == 0:
             torch.save(
-                model.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_{iteration+1}.pth'))
+                model.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_'+str(iteration+1)+'_synth.pth'))
             if not opt.ocrFixed:
                 torch.save(
-                    ocrModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_{iteration+1}_ocr.pth'))
+                    ocrModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_'+str(iteration+1)+'_ocr.pth'))
             torch.save(
-                disModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_{iteration+1}_dis.pth'))
+                disModel.state_dict(), os.path.join(opt.exp_dir,opt.exp_name,'iter_'+str(iteration+1)+'_dis.pth'))
 
         if (iteration + 1) == opt.num_iter:
             print('end the training')
             sys.exit()
         iteration += 1
 
+
+def get_scheduler(optimizer, opt):
+    if opt.lr_policy == 'None':
+        scheduler = None # constant scheduler
+    elif opt.lr_policy == 'step':
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=opt.step_size,
+                                        gamma=opt.gamma, last_epoch=-1)
+    else:
+        return NotImplementedError('learning rate policy [%s] is not implemented', opt.lr_policy)
+    
+    return scheduler
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -558,16 +600,21 @@ if __name__ == '__main__':
     parser.add_argument('--saved_synth_model', default='', help="path to model to continue training")
     parser.add_argument('--saved_dis_model', default='', help="path to model to continue training")
     parser.add_argument('--FT', action='store_true', help='whether to do fine-tuning')
-    parser.add_argument('--adam', action='store_true', help='Whether to use adam (default is Adadelta)')
+    parser.add_argument('--optim', default='adadelta', help='Whether to use adam (default is Adadelta)')
     parser.add_argument('--lr', type=float, default=1, help='learning rate, default=1.0 for Adadelta')
     parser.add_argument('--beta1', type=float, default=0.9, help='beta1 for adam. default=0.9')
+    parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for adam. default=0.999')
+    parser.add_argument('--lr_policy', default='None', help='None|step')
+    parser.add_argument('--step_size', type=int, default=100000, help='step size')
+    parser.add_argument('--gamma', type=float, default=0.5, help='how much to decay learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay')
     parser.add_argument('--rho', type=float, default=0.95, help='decay rate rho for Adadelta. default=0.95')
     parser.add_argument('--eps', type=float, default=1e-8, help='eps for Adadelta. default=1e-8')
     parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping value. default=5')
     """ Data processing """
-    parser.add_argument('--select_data', type=str, default='MJ-ST',
+    parser.add_argument('--select_data', type=str, default='ST',
                         help='select training data (default is MJ-ST, which means MJ and ST used as training data)')
-    parser.add_argument('--batch_ratio', type=str, default='0.5-0.5',
+    parser.add_argument('--batch_ratio', type=str, default='1.0',
                         help='assign ratio for each selected data in the batch')
     parser.add_argument('--total_data_usage_ratio', type=str, default='1.0',
                         help='total data usage ratio, this ratio is multiplied to total number of data.')
@@ -575,8 +622,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_min_length', type=int, default=1, help='minimum-label-length')
     parser.add_argument('--fixedString', action='store_true', help='use fixed length data')
     parser.add_argument('--batch_exact_length', type=int, default=5, help='exact-label-length')
-    parser.add_argument('--imgH', type=int, default=48, help='the height of the input image')
-    parser.add_argument('--imgW', type=int, default=288, help='the width of the input image')
+    parser.add_argument('--imgH', type=int, default=32, help='the height of the input image')
+    parser.add_argument('--imgW', type=int, default=100, help='the width of the input image')
     parser.add_argument('--ocr_imgH', type=int, default=32, help='the height of the input image')
     parser.add_argument('--ocr_imgW', type=int, default=100, help='the width of the input image')
     parser.add_argument('--rgb', action='store_true', help='use rgb input')
@@ -608,9 +655,11 @@ if __name__ == '__main__':
     parser.add_argument('--disWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--styleReconWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--styleDetach', action='store_true', help='whether to detach style')
-
+    parser.add_argument('--gan_type', default='lsgan', help='lsgan/nsgan/wgan')
 
     parser.add_argument('--debugFlag', action='store_true', help='for debugging')
+    parser.add_argument('--modelFolderFlag', action='store_true', help='load latest files from saved model folder')
+    parser.add_argument('--testFlag', action='store_true', help='for testing')
 
     opt = parser.parse_args()
 
