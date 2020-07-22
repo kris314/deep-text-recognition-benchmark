@@ -18,16 +18,15 @@ import pdb
 
 from utils import CTCLabelConverter, AttnLabelConverter, Averager
 from dataset import hierarchical_dataset, AlignCollate, Batch_Balanced_Dataset, tensor2im, save_image
-from model import Model, AdaINGen, MsImageDisV1
+from model import Model, AdaINGenV4, MsImageDisV1
 from test_synth import validation, validation_synth, validation_synth_adv, validation_synth_lrw, validation_synth_lrw_res
 
 import tflib as lib
 import tflib.plot
 
+from pytorch_msssim import msssim, ssim
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-
 
 
 def train(opt):
@@ -74,7 +73,7 @@ def train(opt):
     if opt.rgb:
         opt.input_channel = 3
     
-    model = AdaINGen(opt)
+    model = AdaINGenV4(opt)
     ocrModel = Model(opt)
     disModel = MsImageDisV1(opt)
     
@@ -118,7 +117,7 @@ def train(opt):
     disModel.train()
 
     if opt.modelFolderFlag:
-        pdb.set_trace()
+        
         if len(glob.glob(os.path.join(opt.exp_dir,opt.exp_name,"iter_*_synth.pth")))>0:
             opt.saved_synth_model = glob.glob(os.path.join(opt.exp_dir,opt.exp_name,"iter_*_synth.pth"))[-1]
         
@@ -159,8 +158,19 @@ def train(opt):
     else:
         ocrCriterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)  # ignore [GO] token = ignore index 0
     
-    recCriterion = torch.nn.L1Loss()
-    styleRecCriterion = torch.nn.L1Loss()
+    if opt.imgReconLoss == 'l1':
+        recCriterion = torch.nn.L1Loss()
+    elif opt.imgReconLoss == 'ssim':
+        recCriterion = ssim
+    elif opt.imgReconLoss == 'ms-ssim':
+        recCriterion = msssim
+
+    if opt.styleLoss == 'l1':
+        styleRecCriterion = torch.nn.L1Loss()
+    elif opt.styleLoss == 'triplet':
+        styleRecCriterion = torch.nn.TripletMarginLoss(margin=opt.tripletMargin, p=1)
+    #for validation; check only positive pairs
+    styleTestRecCriterion = torch.nn.L1Loss()
 
     # loss averager
     loss_avg_ocr = Averager()
@@ -238,7 +248,7 @@ def train(opt):
 
     """ start training """
     start_iter = 0
-    pdb.set_trace()
+    
     if opt.saved_synth_model != '' and opt.saved_synth_model != 'None':
         try:
             start_iter = int(opt.saved_synth_model.split('_')[-2].split('.')[0])
@@ -282,7 +292,11 @@ def train(opt):
         disCnt = int(image_tensors_all.size(0)/2)
         image_tensors, image_tensors_real, labels_gt, labels_2 = image_tensors_all[:disCnt], image_tensors_all[disCnt:disCnt+disCnt], labels_1_all[:disCnt], labels_2_all[:disCnt]
 
+        image_hole_tensors, image_mask_tensors = genRandomMasks(image_tensors)
+
         image = image_tensors.to(device)
+        image_hole_tensors = image_hole_tensors.to(device)
+        image_mask_tensors = image_mask_tensors.to(device)
         image_real = image_tensors_real.to(device)
         batch_size = image.size(0)
 
@@ -317,7 +331,8 @@ def train(opt):
         text_2, length_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
         
         #forward pass from style and word generator
-        images_recon_1, images_recon_2, style = model(image, text_1, text_2)
+        # images_recon_1, images_recon_2, style = model(image, text_1, text_2)
+        images_recon_1, images_recon_2, style = model(image_hole_tensors, text_1, text_2)
 
         if 'CTC' in opt.Prediction:
             
@@ -385,20 +400,32 @@ def train(opt):
         #Adversarial loss
         disGenCost = 0.5*(disModel.module.calc_gen_loss(images_recon_1)+disModel.module.calc_gen_loss(images_recon_2))
 
-        #Input reconstruction loss
-        recCost = recCriterion(images_recon_1,image)
+        #Input image reconstruction loss
+        if opt.imgReconLoss == 'ssim':
+            recCost = -1*recCriterion(images_recon_1,image, val_range=2)
+        elif opt.imgReconLoss == 'ms-ssim':
+            recCost = -1*recCriterion(images_recon_1,image, val_range=2, normalize='relu')
+        else:
+            recCost = 0.5*(recCriterion(image_mask_tensors*images_recon_1, image_mask_tensors*image) + recCriterion((1-image_mask_tensors)*images_recon_1, (1-image_mask_tensors)*image))
+        
 
         #Pair style reconstruction loss
         if opt.styleReconWeight == 0.0:
             styleRecCost = torch.tensor(0.0)
         else:
-            if opt.styleDetach:
-                styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style.detach())
-            else:
-                styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style)
+            if opt.styleLoss == 'l1':
+                if opt.styleDetach:
+                    styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style.detach())
+                else:
+                    styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style)
+            elif opt.styleLoss=='triplet':
+                if opt.styleDetach:
+                    styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style.detach(), model(image_real, None, None, styleFlag=True))
+                else:
+                    styleRecCost = styleRecCriterion(model(images_recon_2, None, None, styleFlag=True), style, model(image_real, None, None, styleFlag=True))
 
         #OCR Content cost
-        ocrCost = 0.5*(ocrCost_1+ocrCost_2)
+        ocrCost = 0.5*(opt.ocrWeight_1*ocrCost_1+opt.ocrWeight_2*ocrCost_2)
 
         cost = opt.ocrWeight*ocrCost + opt.reconWeight*recCost + opt.disWeight*disGenCost + opt.styleReconWeight*styleRecCost
 
@@ -444,7 +471,7 @@ def train(opt):
                 
                 with torch.no_grad():                    
                     valid_loss, current_accuracy, current_norm_ED, preds, confidence_score, labels, infer_time, length_of_data = validation_synth_lrw_res(
-                        iteration, model, ocrModel, disModel, recCriterion, styleRecCriterion, ocrCriterion, valid_loader, converter, opt)
+                        iteration, model, ocrModel, disModel, recCriterion, styleTestRecCriterion, ocrCriterion, valid_loader, converter, opt)
                 model.train()
                 if not opt.ocrFixed:
                     ocrModel.train()
@@ -573,6 +600,22 @@ def train(opt):
             sys.exit()
         iteration += 1
 
+def genRandomMasks(image_tensor):
+    batch_size, numC, imgH, imgW = image_tensor.shape
+
+    mask_tensor = torch.ones(batch_size, numC, imgH, imgW)
+    image_hole_tensor = torch.ones(batch_size, numC, imgH, imgW)
+    image_hole_tensor[:,:,:,:] = image_tensor[:,:,:,:]
+    for i in range(batch_size):
+        maskSize=(random.randint(15,30),random.randint(15,30))
+        maxY = imgH-maskSize[0]
+        maxX = imgW-maskSize[1]
+        startY=random.randint(0,maxY-1)
+        startX=random.randint(0,maxX-1)
+
+        mask_tensor[i,:, startY:startY+maskSize[0], startX:startX+maskSize[1]] = 0.0
+        image_hole_tensor[i,:, startY:startY+maskSize[0], startX:startX+maskSize[1]] = 0.0
+    return image_hole_tensor, mask_tensor
 
 def get_scheduler(optimizer, opt):
     if opt.lr_policy == 'None':
@@ -587,7 +630,7 @@ def get_scheduler(optimizer, opt):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--exp_dir', default='/checkpoint/pkrishnan/experiments/scribe/Exp06/', help='Where to store logs and models')
+    parser.add_argument('--exp_dir', default='/checkpoint/pkrishnan/experiments/scribe/Exp08/', help='Where to store logs and models')
     parser.add_argument('--exp_name', default='debug', help='Where to store logs and models')
     parser.add_argument('--train_data', required=True, help='path to training dataset')
     parser.add_argument('--valid_data', required=True, help='path to validation dataset')
@@ -651,11 +694,16 @@ if __name__ == '__main__':
     parser.add_argument('--char_embed_size', type=int, default=60, help='character embedding for content encoder')
     parser.add_argument('--ocrFixed', action='store_true', help='true: for pretrined OCR and fixed weights')
     parser.add_argument('--ocrWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--ocrWeight_1', type=float, default=1.0, help='weights for O_s^{c1} loss')
+    parser.add_argument('--ocrWeight_2', type=float, default=1.0, help='weights for O_s^{c2} loss')
     parser.add_argument('--reconWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--disWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--styleReconWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--styleDetach', action='store_true', help='whether to detach style')
     parser.add_argument('--gan_type', default='lsgan', help='lsgan/nsgan/wgan')
+    parser.add_argument('--imgReconLoss', default='l1', help='l1/ssim/ms-ssim')
+    parser.add_argument('--styleLoss', default='l1', help='l1/triplet')
+    parser.add_argument('--tripletMargin', type=float, default=1.0, help='triplet margin')
 
     parser.add_argument('--debugFlag', action='store_true', help='for debugging')
     parser.add_argument('--modelFolderFlag', action='store_true', help='load latest files from saved model folder')
