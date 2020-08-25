@@ -19,6 +19,31 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 import pdb
 
+def make_noise(batch, latent_dim, n_noise, device):
+    if n_noise == 1:
+        return torch.randn(batch, latent_dim, device=device)
+
+    noises = torch.randn(n_noise, batch, latent_dim, device=device).unbind(0)
+
+    return noises
+
+def mixing_noise(batch, latent_dim, prob, device):
+    if prob > 0 and random.random() < prob:
+        return make_noise(batch, latent_dim, 2, device)
+
+    else:
+        return [make_noise(batch, latent_dim, 1, device)]
+
+def g_nonsaturating_loss(fake_pred):
+    loss = F.softplus(-fake_pred).mean()
+
+    return loss
+
+def d_logistic_loss(real_pred, fake_pred):
+    real_loss = F.softplus(-real_pred)
+    fake_loss = F.softplus(fake_pred)
+
+    return real_loss.mean() + fake_loss.mean()
 def benchmark_all_eval(synthModel, ocrModel, recCriterion, styleRecCriterion, ocrCriterion, converter, opt, calculate_infer_time=False):
     """ evaluation with 10 benchmark evaluation datasets """
     # The evaluation datasets, dataset order is same with Table 1 in our paper.
@@ -1468,6 +1493,656 @@ def validation_synth_v2(iterCntr, synthModel, ocrModel, disModel, recCriterion, 
     random.seed()
 
     return [valid_loss_avg_ocr.val(), valid_loss_avg.val(), valid_loss_avg_dis.val(), valid_loss_avg_ocrRecon_1.val(),valid_loss_avg_ocrRecon_2.val(), valid_loss_avg_gen.val(), valid_loss_avg_imgRecon.val(), valid_loss_avg_styRecon.val()], [accuracy_ocr,accuracy_1,accuracy_2], [norm_ED_ocr,norm_ED_1,norm_ED_2], [preds_str_ocr, preds_str_1,preds_str_2], [confidence_score_list_ocr,confidence_score_list_1,confidence_score_list_2], [labels_gt,labels_1,labels_2], infer_time, length_of_data
+
+def validation_synth_v3(iterCntr, styleModel, genModel, vggModel, disModel, recCriterion, evaluation_loader, converter, opt):
+    """ validation or evaluation """
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
+    random.seed(1024)
+
+    length_of_data = 0
+    infer_time = 0
+
+    valid_loss_avg = Averager()
+    valid_loss_avg_dis = Averager()
+
+    valid_loss_avg_gen = Averager()
+    valid_loss_avg_imgRecon = Averager()
+    valid_loss_avg_vgg_per = Averager()
+    valid_loss_avg_vgg_sty = Averager()
+
+    lexicons=[]
+    out_of_char = f'[^{opt.character}]'
+
+    # #read lexicons file
+    # with open(opt.lexFile,'r') as lexF:
+    #     for line in lexF:
+    #         lexWord = line[:-1]
+    #         if opt.fixedString and len(lexWord)!=opt.batch_exact_length:
+    #             continue
+    #         if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())) and len(lexWord) >= opt.batch_min_length:
+    #             lexicons.append(lexWord)
+
+    for i, (image_input_tensors, image_gt_tensors, labels_1, labels_2) in enumerate(evaluation_loader):
+        
+        if opt.debugFlag and i>0:
+            break
+        
+        # disCnt = int(image_tensors_all.size(0)/2)
+        
+        labels_gt = labels_1
+
+        image_input_tensors = image_input_tensors.to(device)
+        image_gt_tensors = image_gt_tensors.to(device)
+        batch_size = image_input_tensors.size(0)
+
+        length_of_data = length_of_data + batch_size
+        
+
+        # For max length prediction
+        # length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+        # text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+
+        text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
+        
+        start_time = time.time()
+        if image_input_tensors.shape[0] == 0:
+            continue
+        
+        style = styleModel(image_input_tensors)
+        images_recon_2 = genModel(style, text_for_loss_2)
+
+        forward_time = time.time() - start_time
+
+        if disModel == None:
+            disCost = torch.tensor(0.0)
+            disGenCost = torch.tensor(0.0)
+        else:
+            if opt.gan_type == 'wgan':
+                disCost = torch.tensor(0.0)
+            else:
+                disCost = disModel.module.calc_dis_loss(torch.cat((images_recon_2.detach(),image_input_tensors),dim=1), torch.cat((image_gt_tensors,image_input_tensors),dim=1))
+            disGenCost = disModel.module.calc_gen_loss(torch.cat((images_recon_2,image_input_tensors),dim=1))
+        
+        if opt.imgReconLoss == 'ssim':
+            recCost = -1*recCriterion(images_recon_1,image, val_range=2)
+        elif opt.imgReconLoss == 'ms-ssim':
+            recCost = -1*recCriterion(images_recon_1,image, val_range=2, normalize='relu')
+        else:
+            recCost = recCriterion(images_recon_2,image_gt_tensors)
+        
+        vggPerCost, vggStyleCost = vggModel(image_gt_tensors, images_recon_2)
+
+        infer_time += forward_time
+        
+        valid_loss_avg.add(opt.reconWeight*recCost + opt.disWeight*disGenCost + opt.vggPerWeight*vggPerCost + opt.vggStyWeight*vggStyleCost)
+        valid_loss_avg_dis.add(opt.disWeight*disCost)
+        
+        #fine grained losses
+        valid_loss_avg_gen.add(opt.disWeight*disGenCost)
+        valid_loss_avg_imgRecon.add(opt.reconWeight*recCost)
+        valid_loss_avg_vgg_per.add(opt.vggPerWeight*vggPerCost)
+        valid_loss_avg_vgg_sty.add(opt.vggStyWeight*vggStyleCost)
+        
+        #Save random reconstructed image and write its gt
+        if opt.testFlag:
+            randomSaveIdx = list(range(0,batch_size))
+        else:
+            randomSaveIdx = [random.randint(0,batch_size-1)]
+        for rIdx in randomSaveIdx:
+            try:
+                save_image(tensor2im(image_input_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_sInput_'+labels_gt[rIdx]+'.png'))
+                save_image(tensor2im(image_gt_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csInput_'+labels_2[rIdx]+'.png'))
+                save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csRecon_'+labels_2[rIdx]+'.png'))
+            except:
+                print('Warning while saving validation image')
+    
+    random.seed()
+
+    return [valid_loss_avg.val(), valid_loss_avg_dis.val(), valid_loss_avg_gen.val(), valid_loss_avg_imgRecon.val(), valid_loss_avg_vgg_per.val(), valid_loss_avg_vgg_sty.val()], infer_time, length_of_data
+
+def validation_synth_v4(iterCntr, styleModel, genModel, vggModel, ocrModel, disModel, recCriterion, ocrCriterion, evaluation_loader, converter, opt):
+    """ validation or evaluation """
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
+    random.seed(1024)
+
+    length_of_data = 0
+    infer_time = 0
+
+    valid_loss_avg = Averager()
+    valid_loss_avg_dis = Averager()
+
+    valid_loss_avg_gen = Averager()
+    valid_loss_avg_imgRecon = Averager()
+    valid_loss_avg_vgg_per = Averager()
+    valid_loss_avg_vgg_sty = Averager()
+    valid_loss_avg_ocr = Averager()
+
+    lexicons=[]
+    out_of_char = f'[^{opt.character}]'
+
+    # #read lexicons file
+    # with open(opt.lexFile,'r') as lexF:
+    #     for line in lexF:
+    #         lexWord = line[:-1]
+    #         if opt.fixedString and len(lexWord)!=opt.batch_exact_length:
+    #             continue
+    #         if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())) and len(lexWord) >= opt.batch_min_length:
+    #             lexicons.append(lexWord)
+
+    for i, (image_input_tensors, image_gt_tensors, labels_1, labels_2) in enumerate(evaluation_loader):
+        
+        if opt.debugFlag and i>0:
+            break
+        
+        # disCnt = int(image_tensors_all.size(0)/2)
+        
+        labels_gt = labels_1
+
+        image_input_tensors = image_input_tensors.to(device)
+        image_gt_tensors = image_gt_tensors.to(device)
+        batch_size = image_input_tensors.size(0)
+
+        length_of_data = length_of_data + batch_size
+        
+
+        # For max length prediction
+        # length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+        # text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+
+        text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
+        
+        start_time = time.time()
+        if image_input_tensors.shape[0] == 0:
+            continue
+        
+        style = styleModel(image_input_tensors)
+        images_recon_2 = genModel(style, text_for_loss_2)
+
+        forward_time = time.time() - start_time
+
+        if disModel == None:
+            disCost = torch.tensor(0.0)
+            disGenCost = torch.tensor(0.0)
+        else:
+            if opt.gan_type == 'wgan':
+                disCost = torch.tensor(0.0)
+            else:
+                disCost = disModel.module.calc_dis_loss(torch.cat((images_recon_2.detach(),image_input_tensors),dim=1), torch.cat((image_gt_tensors,image_input_tensors),dim=1))
+            disGenCost = disModel.module.calc_gen_loss(torch.cat((images_recon_2,image_input_tensors),dim=1))
+        
+        if opt.imgReconLoss == 'ssim':
+            recCost = -1*recCriterion(images_recon_1,image, val_range=2)
+        elif opt.imgReconLoss == 'ms-ssim':
+            recCost = -1*recCriterion(images_recon_1,image, val_range=2, normalize='relu')
+        else:
+            recCost = recCriterion(images_recon_2,image_gt_tensors)
+        
+        vggPerCost, vggStyleCost = vggModel(image_gt_tensors, images_recon_2)
+
+        #ocr loss
+        text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+        if opt.contentLoss == 'vis' or opt.contentLoss == 'seq':
+            preds_recon = ocrModel(images_recon_2, text_for_pred, is_train=False, returnFeat=opt.contentLoss)
+            preds_gt = ocrModel(image_gt_tensors, text_for_pred, is_train=False, returnFeat=opt.contentLoss)
+            ocrCost = ocrCriterion(preds_recon, preds_gt)
+        else:
+            if 'CTC' in opt.Prediction:
+                preds_recon = ocrModel(images_recon_2, text_for_pred, is_train=False)
+                preds_size = torch.IntTensor([preds_recon.size(1)] * batch_size)
+                preds_recon = preds_recon.log_softmax(2).permute(1, 0, 2)
+                ocrCost = ocrCriterion(preds_recon, text_for_loss_2, preds_size, length_2)
+            else:
+                preds_recon = ocrModel(images_recon_2, text_for_pred[:, :-1], is_train=False)  # align with Attention.forward
+                target_2 = text_for_loss_2[:, 1:]  # without [GO] Symbol
+                ocrCost = ocrCriterion(preds_recon.view(-1, preds_recon.shape[-1]), target_2.contiguous().view(-1))
+
+        infer_time += forward_time
+        
+        valid_loss_avg.add(opt.reconWeight*recCost + opt.disWeight*disGenCost + opt.vggPerWeight*vggPerCost + opt.vggStyWeight*vggStyleCost + opt.ocrWeight*ocrCost)
+        valid_loss_avg_dis.add(opt.disWeight*disCost)
+        
+        #fine grained losses
+        valid_loss_avg_gen.add(opt.disWeight*disGenCost)
+        valid_loss_avg_imgRecon.add(opt.reconWeight*recCost)
+        valid_loss_avg_vgg_per.add(opt.vggPerWeight*vggPerCost)
+        valid_loss_avg_vgg_sty.add(opt.vggStyWeight*vggStyleCost)
+        valid_loss_avg_ocr.add(opt.ocrWeight*ocrCost)
+        
+        #Save random reconstructed image and write its gt
+        if opt.testFlag:
+            randomSaveIdx = list(range(0,batch_size))
+        else:
+            randomSaveIdx = [random.randint(0,batch_size-1)]
+        for rIdx in randomSaveIdx:
+            try:
+                save_image(tensor2im(image_input_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_sInput_'+labels_gt[rIdx]+'.png'))
+                save_image(tensor2im(image_gt_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csInput_'+labels_2[rIdx]+'.png'))
+                save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csRecon_'+labels_2[rIdx]+'.png'))
+            except:
+                print('Warning while saving validation image')
+    
+    random.seed()
+
+    return [valid_loss_avg.val(), valid_loss_avg_dis.val(), valid_loss_avg_gen.val(), valid_loss_avg_imgRecon.val(), valid_loss_avg_vgg_per.val(), valid_loss_avg_vgg_sty.val(), valid_loss_avg_ocr.val()], infer_time, length_of_data
+
+def validation_synth_v5(iterCntr, styleModel, genModel, mixModel, vggModel, ocrModel, disModel, recCriterion, ocrCriterion, evaluation_loader, converter, opt):
+    """ validation or evaluation """
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
+    random.seed(1024)
+
+    length_of_data = 0
+    infer_time = 0
+
+    valid_loss_avg = Averager()
+    valid_loss_avg_dis = Averager()
+
+    valid_loss_avg_gen = Averager()
+    valid_loss_avg_imgRecon = Averager()
+    valid_loss_avg_vgg_per = Averager()
+    valid_loss_avg_vgg_sty = Averager()
+    valid_loss_avg_ocr = Averager()
+
+    lexicons=[]
+    out_of_char = f'[^{opt.character}]'
+
+    # #read lexicons file
+    # with open(opt.lexFile,'r') as lexF:
+    #     for line in lexF:
+    #         lexWord = line[:-1]
+    #         if opt.fixedString and len(lexWord)!=opt.batch_exact_length:
+    #             continue
+    #         if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())) and len(lexWord) >= opt.batch_min_length:
+    #             lexicons.append(lexWord)
+
+    for i, (image_input_tensors, image_gt_tensors, labels_1, labels_2) in enumerate(evaluation_loader):
+        
+        if opt.debugFlag and i>5:
+            break
+        
+        # disCnt = int(image_tensors_all.size(0)/2)
+        
+        labels_gt = labels_1
+
+        image_input_tensors = image_input_tensors.to(device)
+        image_gt_tensors = image_gt_tensors.to(device)
+        batch_size = image_input_tensors.size(0)
+
+        length_of_data = length_of_data + batch_size
+        
+
+        # For max length prediction
+        # length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+        # text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+
+        text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
+        
+        start_time = time.time()
+        if image_input_tensors.shape[0] == 0:
+            continue
+        
+        style = styleModel(image_input_tensors).squeeze(2).squeeze(2)
+        scInput = mixModel(style,text_for_loss_2)
+        images_recon_2, _ = genModel([scInput], input_is_latent=opt.input_latent)
+
+        forward_time = time.time() - start_time
+
+        if disModel == None:
+            disCost = torch.tensor(0.0)
+            disGenCost = torch.tensor(0.0)
+        else:
+            if opt.gan_type == 'wgan':
+                disCost = torch.tensor(0.0)
+            else:
+                # disCost = disModel.module.calc_dis_loss(torch.cat((images_recon_2.detach(),image_input_tensors),dim=1), torch.cat((image_gt_tensors,image_input_tensors),dim=1))
+
+                fake_pred = disModel(torch.cat((images_recon_2,image_input_tensors),dim=1))
+                real_pred = disModel(torch.cat((image_gt_tensors,image_input_tensors),dim=1))
+                disCost = d_logistic_loss(real_pred, fake_pred)
+
+            # disGenCost = disModel.module.calc_gen_loss(torch.cat((images_recon_2,image_input_tensors),dim=1))
+            
+            fake_pred = disModel(torch.cat((images_recon_2,image_input_tensors),dim=1))
+            disGenCost = g_nonsaturating_loss(fake_pred)
+        
+        if opt.imgReconLoss == 'ssim':
+            recCost = -1*recCriterion(images_recon_1,image, val_range=2)
+        elif opt.imgReconLoss == 'ms-ssim':
+            recCost = -1*recCriterion(images_recon_1,image, val_range=2, normalize='relu')
+        else:
+            recCost = recCriterion(images_recon_2,image_gt_tensors)
+        
+        vggPerCost, vggStyleCost = vggModel(image_gt_tensors, images_recon_2)
+
+        #ocr loss
+        text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+        if opt.contentLoss == 'vis' or opt.contentLoss == 'seq':
+            preds_recon = ocrModel(images_recon_2, text_for_pred, is_train=False, returnFeat=opt.contentLoss)
+            preds_gt = ocrModel(image_gt_tensors, text_for_pred, is_train=False, returnFeat=opt.contentLoss)
+            ocrCost = ocrCriterion(preds_recon, preds_gt)
+        else:
+            if 'CTC' in opt.Prediction:
+                preds_recon = ocrModel(images_recon_2, text_for_pred, is_train=False)
+                preds_size = torch.IntTensor([preds_recon.size(1)] * batch_size)
+                preds_recon = preds_recon.log_softmax(2).permute(1, 0, 2)
+                ocrCost = ocrCriterion(preds_recon, text_for_loss_2, preds_size, length_2)
+            else:
+                preds_recon = ocrModel(images_recon_2, text_for_pred[:, :-1], is_train=False)  # align with Attention.forward
+                target_2 = text_for_loss_2[:, 1:]  # without [GO] Symbol
+                ocrCost = ocrCriterion(preds_recon.view(-1, preds_recon.shape[-1]), target_2.contiguous().view(-1))
+
+        infer_time += forward_time
+        
+        valid_loss_avg.add(opt.reconWeight*recCost + opt.disWeight*disGenCost + opt.vggPerWeight*vggPerCost + opt.vggStyWeight*vggStyleCost + opt.ocrWeight*ocrCost)
+        valid_loss_avg_dis.add(opt.disWeight*disCost)
+        
+        #fine grained losses
+        valid_loss_avg_gen.add(opt.disWeight*disGenCost)
+        valid_loss_avg_imgRecon.add(opt.reconWeight*recCost)
+        valid_loss_avg_vgg_per.add(opt.vggPerWeight*vggPerCost)
+        valid_loss_avg_vgg_sty.add(opt.vggStyWeight*vggStyleCost)
+        valid_loss_avg_ocr.add(opt.ocrWeight*ocrCost)
+        
+        #Save random reconstructed image and write its gt
+        if opt.testFlag:
+            randomSaveIdx = list(range(0,batch_size))
+        else:
+            randomSaveIdx = [random.randint(0,batch_size-1)]
+        for rIdx in randomSaveIdx:
+            try:
+                save_image(tensor2im(image_input_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_sInput_'+labels_gt[rIdx]+'.png'))
+                save_image(tensor2im(image_gt_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csInput_'+labels_2[rIdx]+'.png'))
+                save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csRecon_'+labels_2[rIdx]+'.png'))
+            except:
+                print('Warning while saving validation image')
+    
+    random.seed()
+
+    return [valid_loss_avg.val(), valid_loss_avg_dis.val(), valid_loss_avg_gen.val(), valid_loss_avg_imgRecon.val(), valid_loss_avg_vgg_per.val(), valid_loss_avg_vgg_sty.val(), valid_loss_avg_ocr.val()], infer_time, length_of_data
+
+def validation_synth_v6(iterCntr, genModel, ocrModel, disModel, ocrCriterion, evaluation_loader, converter, opt):
+    """ validation or evaluation """
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
+    random.seed(1024)
+
+    length_of_data = 0
+    infer_time = 0
+
+    valid_loss_avg = Averager()
+    valid_loss_avg_dis = Averager()
+
+    valid_loss_avg_gen = Averager()
+    valid_loss_avg_imgRecon = Averager()
+    valid_loss_avg_vgg_per = Averager()
+    valid_loss_avg_vgg_sty = Averager()
+    valid_loss_avg_ocr = Averager()
+
+    lexicons=[]
+    out_of_char = f'[^{opt.character}]'
+
+    # #read lexicons file
+    # with open(opt.lexFile,'r') as lexF:
+    #     for line in lexF:
+    #         lexWord = line[:-1]
+    #         if opt.fixedString and len(lexWord)!=opt.batch_exact_length:
+    #             continue
+    #         if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())) and len(lexWord) >= opt.batch_min_length:
+    #             lexicons.append(lexWord)
+
+    for i, (image_input_tensors, image_gt_tensors, labels_1, labels_2) in enumerate(evaluation_loader):
+        
+        if opt.debugFlag and i>5:
+            break
+        
+        # disCnt = int(image_tensors_all.size(0)/2)
+        
+        labels_gt = labels_1
+
+        image_input_tensors = image_input_tensors.to(device)
+        image_gt_tensors = image_gt_tensors.to(device)
+        batch_size = image_input_tensors.size(0)
+
+        length_of_data = length_of_data + batch_size
+        
+
+        # For max length prediction
+        # length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+        # text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+
+        text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
+        
+        start_time = time.time()
+        if image_input_tensors.shape[0] == 0:
+            continue
+        
+        # style = styleModel(image_input_tensors).squeeze(2).squeeze(2)
+        # scInput = mixModel(style,text_for_loss_2)
+        style = mixing_noise(batch_size, opt.latent, opt.mixing, device)
+        # images_recon_2, _ = genModel(style, text_for_loss_2, input_is_latent=opt.input_latent)
+        if 'CTC' in opt.Prediction:
+            images_recon_2, _ = genModel(style, text_for_loss_2, input_is_latent=opt.input_latent)
+        else:
+            images_recon_2, _ = genModel(style, text_for_loss_2[:,1:-1], input_is_latent=opt.input_latent)
+
+        forward_time = time.time() - start_time
+
+        if disModel == None:
+            disCost = torch.tensor(0.0)
+            disGenCost = torch.tensor(0.0)
+        else:
+            if opt.gan_type == 'wgan':
+                disCost = torch.tensor(0.0)
+            else:
+                # disCost = disModel.module.calc_dis_loss(torch.cat((images_recon_2.detach(),image_input_tensors),dim=1), torch.cat((image_gt_tensors,image_input_tensors),dim=1))
+
+                # fake_pred = disModel(torch.cat((images_recon_2,image_input_tensors),dim=1))
+                # real_pred = disModel(torch.cat((image_gt_tensors,image_input_tensors),dim=1))
+                fake_pred = disModel(images_recon_2)
+                real_pred = disModel(image_gt_tensors)
+                disCost = d_logistic_loss(real_pred, fake_pred)
+
+            # disGenCost = disModel.module.calc_gen_loss(torch.cat((images_recon_2,image_input_tensors),dim=1))
+            
+            # fake_pred = disModel(torch.cat((images_recon_2,image_input_tensors),dim=1))
+            fake_pred = disModel(images_recon_2)
+            disGenCost = g_nonsaturating_loss(fake_pred)
+        
+        # if opt.imgReconLoss == 'ssim':
+        #     recCost = -1*recCriterion(images_recon_1,image, val_range=2)
+        # elif opt.imgReconLoss == 'ms-ssim':
+        #     recCost = -1*recCriterion(images_recon_1,image, val_range=2, normalize='relu')
+        # else:
+        #     recCost = recCriterion(images_recon_2,image_gt_tensors)
+        
+        # vggPerCost, vggStyleCost = vggModel(image_gt_tensors, images_recon_2)
+
+        #ocr loss
+        text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+        if opt.contentLoss == 'vis' or opt.contentLoss == 'seq':
+            preds_recon = ocrModel(images_recon_2, text_for_pred, is_train=False, returnFeat=opt.contentLoss)
+            preds_gt = ocrModel(image_gt_tensors, text_for_pred, is_train=False, returnFeat=opt.contentLoss)
+            ocrCost = ocrCriterion(preds_recon, preds_gt)
+        else:
+            if 'CTC' in opt.Prediction:
+                preds_recon = ocrModel(images_recon_2, text_for_pred, is_train=False)
+                preds_size = torch.IntTensor([preds_recon.size(1)] * batch_size)
+                preds_recon = preds_recon.log_softmax(2).permute(1, 0, 2)
+                ocrCost = ocrCriterion(preds_recon, text_for_loss_2, preds_size, length_for_loss_2)
+            else:
+                preds_recon = ocrModel(images_recon_2, text_for_pred[:, :-1], is_train=False)  # align with Attention.forward
+                target_2 = text_for_loss_2[:, 1:]  # without [GO] Symbol
+                ocrCost = ocrCriterion(preds_recon.view(-1, preds_recon.shape[-1]), target_2.contiguous().view(-1))
+
+        infer_time += forward_time
+        
+        # valid_loss_avg.add(opt.reconWeight*recCost + opt.disWeight*disGenCost + opt.vggPerWeight*vggPerCost + opt.vggStyWeight*vggStyleCost + opt.ocrWeight*ocrCost)
+        valid_loss_avg.add(opt.disWeight*disGenCost + opt.ocrWeight*ocrCost)
+        valid_loss_avg_dis.add(opt.disWeight*disCost)
+        
+        #fine grained losses
+        valid_loss_avg_gen.add(opt.disWeight*disGenCost)
+        valid_loss_avg_imgRecon.add(torch.tensor(0.0))
+        valid_loss_avg_vgg_per.add(torch.tensor(0.0))
+        valid_loss_avg_vgg_sty.add(torch.tensor(0.0))
+        valid_loss_avg_ocr.add(opt.ocrWeight*ocrCost)
+        
+        #Save random reconstructed image and write its gt
+        if opt.testFlag:
+            randomSaveIdx = list(range(0,batch_size))
+        else:
+            randomSaveIdx = [random.randint(0,batch_size-1)]
+        for rIdx in randomSaveIdx:
+            try:
+                save_image(tensor2im(image_input_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_sInput_'+labels_gt[rIdx]+'.png'))
+                save_image(tensor2im(image_gt_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csInput_'+labels_2[rIdx]+'.png'))
+                save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csRecon_'+labels_2[rIdx]+'.png'))
+            except:
+                print('Warning while saving validation image')
+    
+    random.seed()
+
+    return [valid_loss_avg.val(), valid_loss_avg_dis.val(), valid_loss_avg_gen.val(), valid_loss_avg_imgRecon.val(), valid_loss_avg_vgg_per.val(), valid_loss_avg_vgg_sty.val(), valid_loss_avg_ocr.val()], infer_time, length_of_data
+
+def validation_synth_v7(iterCntr, genModel, ocrModel, disModel, ocrCriterion, evaluation_loader, converter, opt):
+    """ validation or evaluation """
+    os.makedirs(os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr)), exist_ok=True)
+    random.seed(1024)
+
+    length_of_data = 0
+    infer_time = 0
+
+    valid_loss_avg = Averager()
+    valid_loss_avg_dis = Averager()
+
+    valid_loss_avg_gen = Averager()
+    valid_loss_avg_imgRecon = Averager()
+    valid_loss_avg_vgg_per = Averager()
+    valid_loss_avg_vgg_sty = Averager()
+    valid_loss_avg_ocr = Averager()
+
+    lexicons=[]
+    out_of_char = f'[^{opt.character}]'
+
+    # #read lexicons file
+    # with open(opt.lexFile,'r') as lexF:
+    #     for line in lexF:
+    #         lexWord = line[:-1]
+    #         if opt.fixedString and len(lexWord)!=opt.batch_exact_length:
+    #             continue
+    #         if len(lexWord) <= opt.batch_max_length and not(re.search(out_of_char, lexWord.lower())) and len(lexWord) >= opt.batch_min_length:
+    #             lexicons.append(lexWord)
+
+    for i, (image_input_tensors, image_gt_tensors, labels_1, labels_2, synthimg_labels_2_tensors) in enumerate(evaluation_loader):
+        
+        if opt.debugFlag and i>5:
+            break
+        
+        # disCnt = int(image_tensors_all.size(0)/2)
+        
+        labels_gt = labels_1
+
+        image_input_tensors = image_input_tensors.to(device)
+        image_gt_tensors = image_gt_tensors.to(device)
+        synthimg_labels_2_tensors = synthimg_labels_2_tensors.to(device)
+        batch_size = image_input_tensors.size(0)
+
+        length_of_data = length_of_data + batch_size
+        
+
+        # For max length prediction
+        # length_for_pred = torch.IntTensor([opt.batch_max_length] * batch_size).to(device)
+        # text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+
+        text_for_loss_2, length_for_loss_2 = converter.encode(labels_2, batch_max_length=opt.batch_max_length)
+        
+        start_time = time.time()
+        if image_input_tensors.shape[0] == 0:
+            continue
+        
+        # style = styleModel(image_input_tensors).squeeze(2).squeeze(2)
+        # scInput = mixModel(style,text_for_loss_2)
+        style = mixing_noise(batch_size, opt.latent, opt.mixing, device)
+        # images_recon_2, _ = genModel(style, text_for_loss_2, input_is_latent=opt.input_latent)
+        
+        images_recon_2, _ = genModel(style, synthimg_labels_2_tensors, input_is_latent=opt.input_latent)
+        
+        forward_time = time.time() - start_time
+
+        if disModel == None:
+            disCost = torch.tensor(0.0)
+            disGenCost = torch.tensor(0.0)
+        else:
+            if opt.gan_type == 'wgan':
+                disCost = torch.tensor(0.0)
+            else:
+                # disCost = disModel.module.calc_dis_loss(torch.cat((images_recon_2.detach(),image_input_tensors),dim=1), torch.cat((image_gt_tensors,image_input_tensors),dim=1))
+
+                # fake_pred = disModel(torch.cat((images_recon_2,image_input_tensors),dim=1))
+                # real_pred = disModel(torch.cat((image_gt_tensors,image_input_tensors),dim=1))
+                fake_pred = disModel(images_recon_2)
+                real_pred = disModel(image_gt_tensors)
+                disCost = d_logistic_loss(real_pred, fake_pred)
+
+            # disGenCost = disModel.module.calc_gen_loss(torch.cat((images_recon_2,image_input_tensors),dim=1))
+            
+            # fake_pred = disModel(torch.cat((images_recon_2,image_input_tensors),dim=1))
+            fake_pred = disModel(images_recon_2)
+            disGenCost = g_nonsaturating_loss(fake_pred)
+        
+        # if opt.imgReconLoss == 'ssim':
+        #     recCost = -1*recCriterion(images_recon_1,image, val_range=2)
+        # elif opt.imgReconLoss == 'ms-ssim':
+        #     recCost = -1*recCriterion(images_recon_1,image, val_range=2, normalize='relu')
+        # else:
+        #     recCost = recCriterion(images_recon_2,image_gt_tensors)
+        
+        # vggPerCost, vggStyleCost = vggModel(image_gt_tensors, images_recon_2)
+
+        #ocr loss
+        text_for_pred = torch.LongTensor(batch_size, opt.batch_max_length + 1).fill_(0).to(device)
+        if opt.contentLoss == 'vis' or opt.contentLoss == 'seq':
+            preds_recon = ocrModel(images_recon_2, text_for_pred, is_train=False, returnFeat=opt.contentLoss)
+            preds_gt = ocrModel(image_gt_tensors, text_for_pred, is_train=False, returnFeat=opt.contentLoss)
+            ocrCost = ocrCriterion(preds_recon, preds_gt)
+        else:
+            if 'CTC' in opt.Prediction:
+                preds_recon = ocrModel(images_recon_2, text_for_pred, is_train=False)
+                preds_size = torch.IntTensor([preds_recon.size(1)] * batch_size)
+                preds_recon = preds_recon.log_softmax(2).permute(1, 0, 2)
+                ocrCost = ocrCriterion(preds_recon, text_for_loss_2, preds_size, length_for_loss_2)
+            else:
+                preds_recon = ocrModel(images_recon_2, text_for_pred[:, :-1], is_train=False)  # align with Attention.forward
+                target_2 = text_for_loss_2[:, 1:]  # without [GO] Symbol
+                ocrCost = ocrCriterion(preds_recon.view(-1, preds_recon.shape[-1]), target_2.contiguous().view(-1))
+
+        infer_time += forward_time
+        
+        # valid_loss_avg.add(opt.reconWeight*recCost + opt.disWeight*disGenCost + opt.vggPerWeight*vggPerCost + opt.vggStyWeight*vggStyleCost + opt.ocrWeight*ocrCost)
+        valid_loss_avg.add(opt.disWeight*disGenCost + opt.ocrWeight*ocrCost)
+        valid_loss_avg_dis.add(opt.disWeight*disCost)
+        
+        #fine grained losses
+        valid_loss_avg_gen.add(opt.disWeight*disGenCost)
+        valid_loss_avg_imgRecon.add(torch.tensor(0.0))
+        valid_loss_avg_vgg_per.add(torch.tensor(0.0))
+        valid_loss_avg_vgg_sty.add(torch.tensor(0.0))
+        valid_loss_avg_ocr.add(opt.ocrWeight*ocrCost)
+        
+        #Save random reconstructed image and write its gt
+        if opt.testFlag:
+            randomSaveIdx = list(range(0,batch_size))
+        else:
+            randomSaveIdx = [random.randint(0,batch_size-1)]
+        for rIdx in randomSaveIdx:
+            try:
+                save_image(tensor2im(image_input_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_sInput_'+labels_gt[rIdx]+'.png'))
+                save_image(tensor2im(image_gt_tensors[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csInput_'+labels_2[rIdx]+'.png'))
+                save_image(tensor2im(images_recon_2[rIdx]),os.path.join(opt.exp_dir,opt.exp_name,'valImages',str(iterCntr),str(i)+'_'+str(rIdx)+'_'+'_csRecon_'+labels_2[rIdx]+'.png'))
+            except:
+                print('Warning while saving validation image')
+    
+    random.seed()
+
+    return [valid_loss_avg.val(), valid_loss_avg_dis.val(), valid_loss_avg_gen.val(), valid_loss_avg_imgRecon.val(), valid_loss_avg_vgg_per.val(), valid_loss_avg_vgg_sty.val(), valid_loss_avg_ocr.val()], infer_time, length_of_data
 
 def test(opt):
     """ model configuration """

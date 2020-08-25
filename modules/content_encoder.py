@@ -29,4 +29,26 @@ class LocalContentEncoder(nn.Module):  #Similar to GANWriting (Kang, arxiv'2020)
         
         return self.g1Encoder(input)
 
+
+class GlobalContentEncoder(nn.Module):
+    def __init__(self, num_class, max_word_length, char_embed_dim, dim):
+        super(GlobalContentEncoder,self).__init__()
+        self.max_word_length = max_word_length
+        self.char_embed_dim = char_embed_dim
+        self.charEmbed = nn.Embedding(num_class, char_embed_dim)
+
+        #Global
+        self.g2Encoder = nn.Sequential(nn.Linear(max_word_length*char_embed_dim, dim),
+                            nn.BatchNorm1d(dim),
+                            nn.ReLU(True),
+                            nn.Linear(dim, dim),
+                            nn.BatchNorm1d(dim),
+                            nn.ReLU(True),
+                            nn.Linear(dim, dim))
+    
+    def forward(self, input):
+        input = self.charEmbed(input)
+        input = input.view(-1,self.max_word_length*self.char_embed_dim)
+        return self.g2Encoder(input)
+
         

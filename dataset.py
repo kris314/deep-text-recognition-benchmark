@@ -13,7 +13,9 @@ import numpy as np
 from torch.utils.data import Dataset, ConcatDataset, Subset
 from torch._utils import _accumulate
 import torchvision.transforms as transforms
+from utils import SynthGenerator
 
+import phoc
 import pdb
 
 class Batch_Balanced_Dataset(object):
@@ -138,7 +140,10 @@ def hierarchical_dataset(root, opt, select_data='/'):
 
             if select_flag:
                 if opt.style_input:
-                    dataset = LmdbStyleDataset(dirpath, opt)
+                    if opt.style_content_input:
+                        dataset = LmdbStyleContentDataset(dirpath, opt)
+                    else:
+                        dataset = LmdbStyleDataset(dirpath, opt)
                 else:
                     dataset = LmdbDataset(dirpath, opt)
                 sub_dataset_log = f'sub-directory:\t/{os.path.relpath(dirpath, root)}\t num samples: {len(dataset)}'
@@ -259,6 +264,7 @@ class LmdbStyleDataset(Dataset):
             sys.exit(0)
 
         with self.env.begin(write=False) as txn:
+            
             nSamples = int(txn.get('num-samples'.encode()))
             self.nSamples = nSamples
             print('nSamples:::::::::::::',nSamples)
@@ -284,7 +290,7 @@ class LmdbStyleDataset(Dataset):
 
                     label2_key = 'label2-%09d'.encode() % index
                     label2 = txn.get(label2_key).decode('utf-8')
-
+                    
                     if self.opt.fixedString and (len(label1) != self.opt.batch_exact_length or len(label2) != self.opt.batch_exact_length) :
                         continue
                     elif len(label1) > self.opt.batch_max_length or len(label1)<self.opt.batch_min_length or len(label2) > self.opt.batch_max_length or len(label2)<self.opt.batch_min_length:
@@ -360,6 +366,243 @@ class LmdbStyleDataset(Dataset):
             label2 = re.sub(out_of_char, '', label2)
 
         return (img1, img2, label1, label2)
+
+class LmdbStylePHOCDataset(Dataset):
+
+    def __init__(self, root, opt):
+
+        self.root = root
+        self.opt = opt
+        self.env = lmdb.open(root, max_readers=32, readonly=True, lock=False, readahead=False, meminit=False)
+        self.phocObj = phoc_gen(opt)
+
+        if not self.env:
+            print('cannot create lmdb from %s' % (root))
+            sys.exit(0)
+
+        with self.env.begin(write=False) as txn:
+            
+            nSamples = int(txn.get('num-samples'.encode()))
+            self.nSamples = nSamples
+            print('nSamples:::::::::::::',nSamples)
+
+            if self.opt.data_filtering_off:
+                # for fast check or benchmark evaluation with no filtering
+                self.filtered_index_list = [index + 1 for index in range(self.nSamples)]
+            else:
+                """ Filtering part
+                If you want to evaluate IC15-2077 & CUTE datasets which have special character labels,
+                use --data_filtering_off and only evaluate on alphabets and digits.
+                see https://github.com/clovaai/deep-text-recognition-benchmark/blob/6593928855fb7abb999a99f428b3e4477d4ae356/dataset.py#L190-L192
+
+                And if you want to evaluate them with the model trained with --sensitive option,
+                use --sensitive and --data_filtering_off,
+                see https://github.com/clovaai/deep-text-recognition-benchmark/blob/dff844874dbe9e0ec8c5a52a7bd08c7f20afe704/test.py#L137-L144
+                """
+                self.filtered_index_list = []
+                for index in range(self.nSamples):
+                    index += 1  # lmdb starts with 1
+                    label1_key = 'label1-%09d'.encode() % index
+                    label1 = txn.get(label1_key).decode('utf-8')
+
+                    label2_key = 'label2-%09d'.encode() % index
+                    label2 = txn.get(label2_key).decode('utf-8')
+                    
+                    if self.opt.fixedString and (len(label1) != self.opt.batch_exact_length or len(label2) != self.opt.batch_exact_length) :
+                        continue
+                    elif len(label1) > self.opt.batch_max_length or len(label1)<self.opt.batch_min_length or len(label2) > self.opt.batch_max_length or len(label2)<self.opt.batch_min_length:
+                        # print(f'The length of the label is longer than max_length: length
+                        # {len(label)}, {label} in dataset {self.root}')
+                        continue
+
+                    # By default, images containing characters which are not in opt.character are filtered.
+                    # You can add [UNK] token to `opt.character` in utils.py instead of this filtering.
+                    out_of_char = f'[^{self.opt.character}]'
+                    if re.search(out_of_char, label1.lower()) or re.search(out_of_char, label2.lower()):
+                        continue
+                    
+                    self.filtered_index_list.append(index)
+
+                self.nSamples = len(self.filtered_index_list)
+
+    def __len__(self):
+        return self.nSamples
+
+    def __getitem__(self, index):
+        assert index <= len(self), 'index range error'
+        index = self.filtered_index_list[index]
+
+        with self.env.begin(write=False) as txn:
+            label1_key = 'label1-%09d'.encode() % index
+            label2_key = 'label2-%09d'.encode() % index
+            
+            label1 = txn.get(label1_key).decode('utf-8')
+            label2 = txn.get(label2_key).decode('utf-8')
+            
+            
+            img1_key = 'image1-%09d'.encode() % index
+            img2_key = 'image2-%09d'.encode() % index
+            img1buf = txn.get(img1_key)
+            img2buf = txn.get(img2_key)
+
+            buf1 = six.BytesIO()
+            buf1.write(img1buf)
+            buf1.seek(0)
+
+            buf2 = six.BytesIO()
+            buf2.write(img2buf)
+            buf2.seek(0)
+
+            try:
+                if self.opt.rgb:
+                    img1 = Image.open(buf1).convert('RGB')  # for color image
+                    img2 = Image.open(buf2).convert('RGB')  # for color image
+                else:
+                    img1 = Image.open(buf1).convert('L')
+                    img2 = Image.open(buf2).convert('L')
+
+            except IOError:
+                print(f'Corrupted image for {index}')
+                # make dummy image and dummy label for corrupted image.
+                if self.opt.rgb:
+                    img1 = Image.new('RGB', (self.opt.imgW, self.opt.imgH))
+                    img2 = Image.new('RGB', (self.opt.imgW, self.opt.imgH))
+                else:
+                    img1 = Image.new('L', (self.opt.imgW, self.opt.imgH))
+                    img2 = Image.new('L', (self.opt.imgW, self.opt.imgH))
+                label1 = '[dummy_label]'
+                label2 = '[dummy_label]'
+
+            if not self.opt.sensitive:
+                label1 = label1.lower()
+                label2 = label2.lower()
+
+            # We only train and evaluate on alphanumerics (or pre-defined character set in train.py)
+            out_of_char = f'[^{self.opt.character}]'
+            label1 = re.sub(out_of_char, '', label1)
+            label2 = re.sub(out_of_char, '', label2)
+            
+        return (img1, img2, label1, label2, self.phocObj.getPhoc(label1), self.phocObj.getPhoc(label2))
+
+class LmdbStyleContentDataset(Dataset):
+
+    def __init__(self, root, opt):
+
+        self.root = root
+        self.opt = opt
+        self.env = lmdb.open(root, max_readers=32, readonly=True, lock=False, readahead=False, meminit=False)
+        
+        self.synthGen = SynthGenerator('/private/home/pkrishnan/fonts/fonts-10-path.txt',imgSize=(64,256))
+
+        if not self.env:
+            print('cannot create lmdb from %s' % (root))
+            sys.exit(0)
+
+        with self.env.begin(write=False) as txn:
+            
+            nSamples = int(txn.get('num-samples'.encode()))
+            self.nSamples = nSamples
+            print('nSamples:::::::::::::',nSamples)
+
+            if self.opt.data_filtering_off:
+                # for fast check or benchmark evaluation with no filtering
+                self.filtered_index_list = [index + 1 for index in range(self.nSamples)]
+            else:
+                """ Filtering part
+                If you want to evaluate IC15-2077 & CUTE datasets which have special character labels,
+                use --data_filtering_off and only evaluate on alphabets and digits.
+                see https://github.com/clovaai/deep-text-recognition-benchmark/blob/6593928855fb7abb999a99f428b3e4477d4ae356/dataset.py#L190-L192
+
+                And if you want to evaluate them with the model trained with --sensitive option,
+                use --sensitive and --data_filtering_off,
+                see https://github.com/clovaai/deep-text-recognition-benchmark/blob/dff844874dbe9e0ec8c5a52a7bd08c7f20afe704/test.py#L137-L144
+                """
+                self.filtered_index_list = []
+                for index in range(self.nSamples):
+                    index += 1  # lmdb starts with 1
+                    label1_key = 'label1-%09d'.encode() % index
+                    label1 = txn.get(label1_key).decode('utf-8')
+
+                    label2_key = 'label2-%09d'.encode() % index
+                    label2 = txn.get(label2_key).decode('utf-8')
+                    
+                    if self.opt.fixedString and (len(label1) != self.opt.batch_exact_length or len(label2) != self.opt.batch_exact_length) :
+                        continue
+                    elif len(label1) > self.opt.batch_max_length or len(label1)<self.opt.batch_min_length or len(label2) > self.opt.batch_max_length or len(label2)<self.opt.batch_min_length:
+                        # print(f'The length of the label is longer than max_length: length
+                        # {len(label)}, {label} in dataset {self.root}')
+                        continue
+
+                    # By default, images containing characters which are not in opt.character are filtered.
+                    # You can add [UNK] token to `opt.character` in utils.py instead of this filtering.
+                    out_of_char = f'[^{self.opt.character}]'
+                    if re.search(out_of_char, label1.lower()) or re.search(out_of_char, label2.lower()):
+                        continue
+                    
+                    self.filtered_index_list.append(index)
+
+                self.nSamples = len(self.filtered_index_list)
+
+    def __len__(self):
+        return self.nSamples
+
+    def __getitem__(self, index):
+        assert index <= len(self), 'index range error'
+        index = self.filtered_index_list[index]
+
+        with self.env.begin(write=False) as txn:
+            label1_key = 'label1-%09d'.encode() % index
+            label2_key = 'label2-%09d'.encode() % index
+            
+            label1 = txn.get(label1_key).decode('utf-8')
+            label2 = txn.get(label2_key).decode('utf-8')
+            
+            
+            img1_key = 'image1-%09d'.encode() % index
+            img2_key = 'image2-%09d'.encode() % index
+            img1buf = txn.get(img1_key)
+            img2buf = txn.get(img2_key)
+
+            buf1 = six.BytesIO()
+            buf1.write(img1buf)
+            buf1.seek(0)
+
+            buf2 = six.BytesIO()
+            buf2.write(img2buf)
+            buf2.seek(0)
+
+            try:
+                if self.opt.rgb:
+                    img1 = Image.open(buf1).convert('RGB')  # for color image
+                    img2 = Image.open(buf2).convert('RGB')  # for color image
+                else:
+                    img1 = Image.open(buf1).convert('L')
+                    img2 = Image.open(buf2).convert('L')
+
+            except IOError:
+                print(f'Corrupted image for {index}')
+                # make dummy image and dummy label for corrupted image.
+                if self.opt.rgb:
+                    img1 = Image.new('RGB', (self.opt.imgW, self.opt.imgH))
+                    img2 = Image.new('RGB', (self.opt.imgW, self.opt.imgH))
+                else:
+                    img1 = Image.new('L', (self.opt.imgW, self.opt.imgH))
+                    img2 = Image.new('L', (self.opt.imgW, self.opt.imgH))
+                label1 = '[dummy_label]'
+                label2 = '[dummy_label]'
+
+            if not self.opt.sensitive:
+                label1 = label1.lower()
+                label2 = label2.lower()
+
+            # We only train and evaluate on alphanumerics (or pre-defined character set in train.py)
+            out_of_char = f'[^{self.opt.character}]'
+            label1 = re.sub(out_of_char, '', label1)
+            label2 = re.sub(out_of_char, '', label2)
+            label2SynthImg = self.synthGen.synthesizeWordImage(label2, 0)
+            
+
+        return (img1, img2, label1, label2, label2SynthImg)
 
 class RawDataset(Dataset):
 
@@ -521,7 +764,117 @@ class AlignPairCollate(object):
 
         return image_tensors1, image_tensors2, labels1, labels2
 
+class AlignPHOCCollate(object):
 
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+
+    def __call__(self, batch):
+        batch = filter(lambda x: x is not None, batch)
+        images1, images2, labels1, labels2, phoc1, phoc2 = zip(*batch)
+
+        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+            resized_max_w = self.imgW
+            input_channel = 3 if images1[0].mode == 'RGB' else 1
+            transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
+
+            resized_images1 = []
+            resized_images2 = []
+            cntr=0
+            for image1 in images1:
+                image2=images2[cntr]
+                w, h = image1.size
+                ratio = w / float(h)
+                if math.ceil(self.imgH * ratio) > self.imgW:
+                    resized_w = self.imgW
+                else:
+                    resized_w = math.ceil(self.imgH * ratio)
+
+                resized_image1 = image1.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images1.append(transform(resized_image1))
+                
+                #resizing image2 w.r.t image1 dimensions
+                resized_image2 = image2.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images2.append(transform(resized_image2))
+                # resized_image.save('./image_test/%d_test.jpg' % w)
+                cntr+=1
+
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in resized_images1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in resized_images2], 0)
+
+        else:
+            transform = ResizeNormalize((self.imgW, self.imgH))
+            image_tensors1 = [transform(image) for image in images1]
+            image_tensors2 = [transform(image) for image in images2]
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in image_tensors1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in image_tensors2], 0)
+        
+        phoc1_tensors = torch.cat([torch.tensor(t).unsqueeze(0) for t in phoc1], 0)
+        phoc2_tensors = torch.cat([torch.tensor(t).unsqueeze(0) for t in phoc2], 0)
+
+        return image_tensors1, image_tensors2, labels1, labels2, phoc1_tensors, phoc2_tensors
+
+class AlignPairImgCollate(object):
+
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+
+    def __call__(self, batch):
+        batch = filter(lambda x: x is not None, batch)
+        images1, images2, labels1, labels2, label2SynthImgs = zip(*batch)
+
+        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+            resized_max_w = self.imgW
+            input_channel = 3 if images1[0].mode == 'RGB' else 1
+            transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
+
+            resized_images1 = []
+            resized_images2 = []
+            resized_label2SynthImgs = []
+
+            cntr=0
+            for image1 in images1:
+                image2=images2[cntr]
+                label2SynthImg=label2SynthImgs[cntr]
+
+                w, h = image1.size
+                ratio = w / float(h)
+                if math.ceil(self.imgH * ratio) > self.imgW:
+                    resized_w = self.imgW
+                else:
+                    resized_w = math.ceil(self.imgH * ratio)
+
+                resized_image1 = image1.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images1.append(transform(resized_image1))
+                
+                #resizing image2 w.r.t image1 dimensions
+                resized_image2 = image2.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images2.append(transform(resized_image2))
+
+                resized_label2SynthImg = label2SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label2SynthImgs.append(transform(resized_label2SynthImg))
+                # resized_image.save('./image_test/%d_test.jpg' % w)
+                cntr+=1
+
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in resized_images1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in resized_images2], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label2SynthImgs], 0)
+
+        else:
+            transform = ResizeNormalize((self.imgW, self.imgH))
+            image_tensors1 = [transform(image) for image in images1]
+            image_tensors2 = [transform(image) for image in images2]
+            
+            label2SynthImg_tensors = [transform(image) for image in label2SynthImgs]
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in image_tensors1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in image_tensors2], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label2SynthImg_tensors], 0)
+
+        return image_tensors1, image_tensors2, labels1, labels2, label2SynthImg_tensors
 
 def tensor2im(image_tensor, imtype=np.uint8):
     image_numpy = image_tensor.cpu().float().numpy()
@@ -534,3 +887,68 @@ def tensor2im(image_tensor, imtype=np.uint8):
 def save_image(image_numpy, image_path):
     image_pil = Image.fromarray(image_numpy)
     image_pil.save(image_path)
+
+# PHOC Dataset iterator
+class phoc_gen(Dataset):
+    def __init__(self, opt):
+        
+        unigram_levels = [1,2,3,4]
+        bigram_levels = [2,3]
+
+        self.word2Idx = {}
+        self.idx2Word = {}
+        self.words=[]
+        strings=[]
+        unqStrings=[]
+
+        if os.path.exists(opt.words_file):
+            lexFID = open(opt.words_file,'r')
+            lines = lexFID.readlines()
+            lexFID.close()
+        else:
+            sys.exit('Lexicon file not found')
+
+        cntr=0
+        gCntr=0
+        for currWord in lines:
+            if opt.sensitive:
+                currWord = currWord[:-1]
+            else:
+                currWord = currWord[:-1].lower()
+            
+            if not(currWord in self.word2Idx):
+                self.word2Idx[currWord] = cntr
+                self.idx2Word[cntr] = currWord
+                unqStrings.append(currWord)
+                cntr+=1
+            
+            self.words.append(self.word2Idx[currWord])
+            strings.append(currWord)
+            gCntr+=1
+        
+        phoc_unigrams = opt.classes
+        phoc_bigrams = phoc.get_most_common_n_grams(strings, num_results=50, n=2)
+        
+        self.phoc_size = len(phoc_unigrams) * np.sum(unigram_levels)
+        
+        if phoc_bigrams is not None:
+            self.phoc_size += len(phoc_bigrams)*np.sum(bigram_levels)
+
+        print('Building PHOC matrix--started')
+        self.phocMat = np.zeros((len(self.words),self.phoc_size), dtype=np.float32)
+        self.phocMat = phoc.build_phoc(unqStrings, phoc_unigrams, unigram_levels, 
+            bigram_levels=bigram_levels, phoc_bigrams=phoc_bigrams, on_unknown_unigram='warn')
+        print('Building PHOC matrix--ended')
+    
+    def __len__(self):
+        return len(self.words)
+
+    def __getitem__(self, index):
+        return (self.phocMat[self.words[index],:], self.idx2Word[self.words[index]])
+    
+    def getPhoc(self, word):
+        if word in self.word2Idx:
+            return self.phocMat[self.word2Idx[word],:]
+        else:
+            print('warning; phoc vector not found')
+            return np.zeros((self.phoc_size),dtype=np.float32)

@@ -1,4 +1,13 @@
 import torch
+
+from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageFont
+from skimage.filters import (threshold_otsu, threshold_niblack,threshold_sauvola)
+import random
+import numpy as np
+import cv2
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -121,3 +130,42 @@ class Averager(object):
             res = self.sum / float(self.n_count)
         return res
 
+class SynthGenerator():
+
+    def __init__(self, fontPathFile, imgSize=(64,256)):
+        
+        self.fontSize = 48
+        self.imgSize = imgSize
+        
+        self.fontPaths = []
+        with open(fontPathFile) as fFile:
+            for line in fFile:
+                self.fontPaths.append(line[:-1])
+
+    def synthesizeWordImage(self, string, testFontIdx=-1):
+        
+        if testFontIdx!=-1:
+            rFontIdx = testFontIdx%len(self.fontPaths)
+        else:
+            rFontIdx = random.randint(0,len(self.fontPaths)-1)
+
+
+        font = ImageFont.truetype(self.fontPaths[rFontIdx], self.fontSize)
+        w, h = font.getsize(string)
+
+        image = Image.new('L', (w,h), 'white')
+        brush = ImageDraw.Draw(image)
+        brush.text((0, 0), string, font=font, fill=0)
+
+        #Converting image to np array to support opencv operations
+        # image = np.array(image).astype(np.uint8)
+        # [row,col] = np.where(image!=255)
+
+        # try:
+        #     newImage = cv2.resize(image[min(row):max(row),min(col):max(col)],(self.imgSize[1],self.imgSize[0]))
+        # except Exception as e:
+        #     print('Warning: Unable to read current synth image'+str(e))
+        #     newImage = np.zeros((self.imgSize[0],self.imgSize[1]),dtype=np.uint8)
+        # # newImage = np.expand_dims(newImage,axis=0)
+        
+        return image

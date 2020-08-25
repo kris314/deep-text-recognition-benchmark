@@ -30,7 +30,6 @@ class WordGenerator(nn.Module):
         
 
     def forward(self, x):
-        
         output = self.res_model(x)
         output = self.up_model(output)
         
@@ -45,6 +44,17 @@ class ResBlocks(nn.Module):
         self.model = []
         for i in range(num_blocks):
             self.model += [ResBlock(dim, norm=norm, activation=activation, pad_type=pad_type)]
+        self.model = nn.Sequential(*self.model)
+
+    def forward(self, x):
+        return self.model(x)
+
+class ResStyleBlocks(nn.Module):
+    def __init__(self, num_blocks, dim, norm='in', activation='relu', pad_type='zero'):
+        super(ResStyleBlocks, self).__init__()
+        self.model = []
+        for i in range(num_blocks):
+            self.model += [ResStyleBlock(dim, norm=norm, activation=activation, pad_type=pad_type)]
         self.model = nn.Sequential(*self.model)
 
     def forward(self, x):
@@ -80,6 +90,58 @@ class ResBlock(nn.Module):
         residual = x
         out = self.model(x)
         out += residual
+        return out
+
+class ResStyleBlock(nn.Module):
+    def __init__(self, dim, norm='in', activation='relu', pad_type='zero'):
+        super(ResStyleBlock, self).__init__()
+
+        model = []
+        model += [Conv2dBlock(dim ,dim//4, 3, 1, 1, norm='none', activation=activation, pad_type=pad_type)]
+        model += [Conv2dBlock(dim//4 ,dim//4, 3, 1, 1, norm='none', activation=activation, pad_type=pad_type)]
+        model += [Conv2dBlock(dim//4 ,dim, 1, 1, 0, norm='none', activation='none', pad_type=pad_type)]
+        self.model = nn.Sequential(*model)
+
+        # initialize normalization
+        norm_dim = dim
+        if norm == 'bn':
+            self.norm = nn.BatchNorm2d(norm_dim)
+        elif norm == 'in':
+            #self.norm = nn.InstanceNorm2d(norm_dim, track_running_stats=True)
+            self.norm = nn.InstanceNorm2d(norm_dim)
+        elif norm == 'ln':
+            self.norm = LayerNorm(norm_dim)
+        elif norm == 'adain':
+            self.norm = AdaptiveInstanceNorm2d(norm_dim)
+        elif norm == 'none' or norm == 'sn':
+            self.norm = None
+        else:
+            assert 0, "Unsupported normalization: {}".format(norm)
+        
+        # initialize activation
+        if activation == 'relu':
+            self.activation = nn.ReLU(inplace=True)
+        elif activation == 'lrelu':
+            self.activation = nn.LeakyReLU(0.2, inplace=True)
+        elif activation == 'prelu':
+            self.activation = nn.PReLU()
+        elif activation == 'selu':
+            self.activation = nn.SELU(inplace=True)
+        elif activation == 'tanh':
+            self.activation = nn.Tanh()
+        elif activation == 'none':
+            self.activation = None
+        else:
+            assert 0, "Unsupported activation: {}".format(activation)
+
+    def forward(self, x):
+        residual = x
+        out = self.model(x)
+        out += residual
+        if self.norm:
+            out = self.norm(out)
+        if self.activation:
+            out = self.activation(out)
         return out
 
 class Conv2dBlock(nn.Module):
