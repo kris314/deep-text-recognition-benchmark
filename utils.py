@@ -119,6 +119,12 @@ class Averager(object):
         v = v.data.sum()
         self.n_count += count
         self.sum += v
+    
+    def addScalar(self, v, count):
+        # count = v.data.numel()
+        v = v.item()
+        self.n_count += count
+        self.sum += v
 
     def reset(self):
         self.n_count = 0

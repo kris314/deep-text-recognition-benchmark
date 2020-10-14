@@ -486,7 +486,7 @@ class LmdbStylePHOCDataset(Dataset):
 
 class LmdbStyleContentDataset(Dataset):
 
-    def __init__(self, root, opt):
+    def __init__(self, root, opt, dataMode=False):
 
         self.root = root
         self.opt = opt
@@ -520,11 +520,19 @@ class LmdbStyleContentDataset(Dataset):
                 self.filtered_index_list = []
                 for index in range(self.nSamples):
                     index += 1  # lmdb starts with 1
-                    label1_key = 'label1-%09d'.encode() % index
-                    label1 = txn.get(label1_key).decode('utf-8')
+                    if dataMode:
+                        #Todo: remove duplication; simplify
+                        label1_key = 'label-%09d'.encode() % index
+                        label1 = txn.get(label1_key).decode('utf-8')
 
-                    label2_key = 'label2-%09d'.encode() % index
-                    label2 = txn.get(label2_key).decode('utf-8')
+                        label2_key = 'label-%09d'.encode() % index
+                        label2 = txn.get(label2_key).decode('utf-8')
+                    else:    
+                        label1_key = 'label1-%09d'.encode() % index
+                        label1 = txn.get(label1_key).decode('utf-8')
+
+                        label2_key = 'label2-%09d'.encode() % index
+                        label2 = txn.get(label2_key).decode('utf-8')
                     
                     if self.opt.fixedString and (len(label1) != self.opt.batch_exact_length or len(label2) != self.opt.batch_exact_length) :
                         continue
@@ -542,6 +550,7 @@ class LmdbStyleContentDataset(Dataset):
                     self.filtered_index_list.append(index)
 
                 self.nSamples = len(self.filtered_index_list)
+                self.realData = dataMode
 
     def __len__(self):
         return self.nSamples
@@ -551,15 +560,25 @@ class LmdbStyleContentDataset(Dataset):
         index = self.filtered_index_list[index]
 
         with self.env.begin(write=False) as txn:
-            label1_key = 'label1-%09d'.encode() % index
-            label2_key = 'label2-%09d'.encode() % index
+            if self.realData:
+                #todo: remove duplication; simplify
+                label1_key = 'label-%09d'.encode() % index
+                label2_key = 'label-%09d'.encode() % index
+            else:
+                label1_key = 'label1-%09d'.encode() % index
+                label2_key = 'label2-%09d'.encode() % index
             
             label1 = txn.get(label1_key).decode('utf-8')
             label2 = txn.get(label2_key).decode('utf-8')
             
-            
-            img1_key = 'image1-%09d'.encode() % index
-            img2_key = 'image2-%09d'.encode() % index
+            if self.realData:
+                #todo: remove duplication; simplify
+                img1_key = 'image-%09d'.encode() % index
+                img2_key = 'image-%09d'.encode() % index
+            else:
+                img1_key = 'image1-%09d'.encode() % index
+                img2_key = 'image2-%09d'.encode() % index
+
             img1buf = txn.get(img1_key)
             img2buf = txn.get(img2_key)
 
@@ -599,10 +618,11 @@ class LmdbStyleContentDataset(Dataset):
             out_of_char = f'[^{self.opt.character}]'
             label1 = re.sub(out_of_char, '', label1)
             label2 = re.sub(out_of_char, '', label2)
+            label1SynthImg = self.synthGen.synthesizeWordImage(label1, 0)
             label2SynthImg = self.synthGen.synthesizeWordImage(label2, 0)
             
 
-        return (img1, img2, label1, label2, label2SynthImg)
+        return (img1, img2, label1, label2, label1SynthImg, label2SynthImg)
 
 class RawDataset(Dataset):
 
@@ -715,6 +735,44 @@ class AlignCollate(object):
 
         return image_tensors, labels
 
+class AlignFontCollate(object):
+
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+
+    def __call__(self, batch):
+        batch = filter(lambda x: x is not None, batch)
+        images, labels = zip(*batch)
+
+        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+            resized_max_w = self.imgW
+            input_channel = 3 if images[0].mode == 'RGB' else 1
+            transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
+
+            resized_images = []
+            for image in images:
+                w, h = image.size
+                ratio = w / float(h)
+                if math.ceil(self.imgH * ratio) > self.imgW:
+                    resized_w = self.imgW
+                else:
+                    resized_w = math.ceil(self.imgH * ratio)
+
+                resized_image = image.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images.append(transform(resized_image))
+                # resized_image.save('./image_test/%d_test.jpg' % w)
+
+            image_tensors = torch.cat([t.unsqueeze(0) for t in resized_images], 0)
+
+        else:
+            transform = ResizeNormalize((self.imgW, self.imgH))
+            image_tensors = [transform(image) for image in images]
+            image_tensors = torch.cat([t.unsqueeze(0) for t in image_tensors], 0)
+        
+        return image_tensors, torch.LongTensor(labels)
+
 class AlignPairCollate(object):
 
     def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
@@ -825,7 +883,7 @@ class AlignPairImgCollate(object):
 
     def __call__(self, batch):
         batch = filter(lambda x: x is not None, batch)
-        images1, images2, labels1, labels2, label2SynthImgs = zip(*batch)
+        images1, images2, labels1, labels2, label1SynthImgs, label2SynthImgs = zip(*batch)
 
         if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
             resized_max_w = self.imgW
@@ -834,11 +892,13 @@ class AlignPairImgCollate(object):
 
             resized_images1 = []
             resized_images2 = []
+            resized_label1SynthImgs = []
             resized_label2SynthImgs = []
 
             cntr=0
             for image1 in images1:
                 image2=images2[cntr]
+                label1SynthImg=label1SynthImgs[cntr]
                 label2SynthImg=label2SynthImgs[cntr]
 
                 w, h = image1.size
@@ -855,6 +915,9 @@ class AlignPairImgCollate(object):
                 resized_image2 = image2.resize((resized_w, self.imgH), Image.BICUBIC)
                 resized_images2.append(transform(resized_image2))
 
+                resized_label1SynthImg = label1SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label1SynthImgs.append(transform(resized_label1SynthImg))
+
                 resized_label2SynthImg = label2SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
                 resized_label2SynthImgs.append(transform(resized_label2SynthImg))
                 # resized_image.save('./image_test/%d_test.jpg' % w)
@@ -862,6 +925,7 @@ class AlignPairImgCollate(object):
 
             image_tensors1 = torch.cat([t.unsqueeze(0) for t in resized_images1], 0)
             image_tensors2 = torch.cat([t.unsqueeze(0) for t in resized_images2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label1SynthImgs], 0)
             label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label2SynthImgs], 0)
 
         else:
@@ -869,12 +933,14 @@ class AlignPairImgCollate(object):
             image_tensors1 = [transform(image) for image in images1]
             image_tensors2 = [transform(image) for image in images2]
             
+            label1SynthImg_tensors = [transform(image) for image in label1SynthImgs]
             label2SynthImg_tensors = [transform(image) for image in label2SynthImgs]
             image_tensors1 = torch.cat([t.unsqueeze(0) for t in image_tensors1], 0)
             image_tensors2 = torch.cat([t.unsqueeze(0) for t in image_tensors2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label1SynthImg_tensors], 0)
             label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label2SynthImg_tensors], 0)
 
-        return image_tensors1, image_tensors2, labels1, labels2, label2SynthImg_tensors
+        return image_tensors1, image_tensors2, labels1, labels2, label1SynthImg_tensors, label2SynthImg_tensors
 
 def tensor2im(image_tensor, imtype=np.uint8):
     image_numpy = image_tensor.cpu().float().numpy()
@@ -952,3 +1018,280 @@ class phoc_gen(Dataset):
         else:
             print('warning; phoc vector not found')
             return np.zeros((self.phoc_size),dtype=np.float32)
+
+
+# PHOC Dataset iterator
+class text_gen(Dataset):
+    def __init__(self, opt):
+        
+        
+
+        self.word2Idx = {}
+        self.idx2Word = {}
+        self.words=[]
+        strings=[]
+        unqStrings=[]
+
+        if os.path.exists(opt.words_file):
+            lexFID = open(opt.words_file,'r')
+            lines = lexFID.readlines()
+            lexFID.close()
+        else:
+            sys.exit('Lexicon file not found')
+
+        cntr=0
+        gCntr=0
+        
+        # We only train and evaluate on alphanumerics (or pre-defined character set in train.py)
+        out_of_char = f'[^{opt.character}]'
+        for currWord in lines:
+            if opt.sensitive:
+                currWord = currWord[:-1]
+            else:
+                currWord = currWord[:-1].lower()
+            
+            currWord = re.sub(out_of_char, '', currWord)
+            
+            if not(currWord in self.word2Idx):
+                self.word2Idx[currWord] = cntr
+                self.idx2Word[cntr] = currWord
+                unqStrings.append(currWord)
+                cntr+=1
+            
+            self.words.append(self.word2Idx[currWord])
+            strings.append(currWord)
+            gCntr+=1
+        
+    
+    def __len__(self):
+        return len(self.words)
+
+    def __getitem__(self, index):
+        return self.idx2Word[self.words[index]]
+
+class text_gen_synth(Dataset):
+    def __init__(self, opt):
+
+        self.word2Idx = {}
+        self.idx2Word = {}
+        self.words=[]
+        self.synthGen = SynthGenerator('/private/home/pkrishnan/fonts/fonts-10-path.txt',imgSize=(64,256))
+
+        strings=[]
+        unqStrings=[]
+
+        if os.path.exists(opt.words_file):
+            lexFID = open(opt.words_file,'r')
+            lines = lexFID.readlines()
+            lexFID.close()
+        else:
+            sys.exit('Lexicon file not found')
+
+        cntr=0
+        gCntr=0
+        
+        # We only train and evaluate on alphanumerics (or pre-defined character set in train.py)
+        out_of_char = f'[^{opt.character}]'
+        for currWord in lines:
+            if opt.sensitive:
+                currWord = currWord[:-1]
+            else:
+                currWord = currWord[:-1].lower()
+            
+            currWord = re.sub(out_of_char, '', currWord)
+            
+            if not(currWord in self.word2Idx):
+                self.word2Idx[currWord] = cntr
+                self.idx2Word[cntr] = currWord
+                unqStrings.append(currWord)
+                cntr+=1
+            
+            self.words.append(self.word2Idx[currWord])
+            strings.append(currWord)
+            gCntr+=1
+        
+    
+    def __len__(self):
+        return len(self.words)
+
+    def __getitem__(self, index):
+        label = self.idx2Word[self.words[index]]  
+
+        return label, self.synthGen.synthesizeWordImage(label, 0)
+
+class AlignSynthTextCollate(object):
+
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+
+    def __call__(self, batch):
+        batch = filter(lambda x: x is not None, batch)
+        labels, labelSynthImgs = zip(*batch)
+
+        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+            resized_max_w = self.imgW
+            input_channel = 3 if labelSynthImgs[0].mode == 'RGB' else 1
+            transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
+
+            resized_labelSynthImgs = []
+
+            cntr=0
+            for labelSynthImg in labelSynthImgs:
+                
+
+                w, h = labelSynthImg.size
+                ratio = w / float(h)
+                if math.ceil(self.imgH * ratio) > self.imgW:
+                    resized_w = self.imgW
+                else:
+                    resized_w = math.ceil(self.imgH * ratio)
+
+                resized_labelSynthImg = labelSynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_labelSynthImgs.append(transform(resized_labelSynthImg))
+                
+                cntr+=1
+
+            labelSynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_labelSynthImgs], 0)
+
+        else:
+            transform = ResizeNormalize((self.imgW, self.imgH))
+            labelSynthImg_tensors = [transform(image) for image in labelSynthImgs]
+            labelSynthImg_tensors = torch.cat([t.unsqueeze(0) for t in labelSynthImg_tensors], 0)
+
+        return labels, labelSynthImg_tensors
+
+
+class fontDataset(Dataset):
+    def __init__(self, imgDir, annFile, transform=None, F2Idx=None, Idx2F=None, numClasses=-1):
+        self.imgDir = imgDir
+        self.imgPath = []
+        self.fontIdx = []
+        # self.initIdx = False
+        self.transform = transform
+
+        if F2Idx:
+            self.F2Idx=F2Idx
+            self.Idx2F=Idx2F
+            # self.initIdx = True
+        else:   
+            self.F2Idx={}
+            self.Idx2F=[]
+        
+        cntr=0
+        fid = open(annFile,'r')
+
+        for line in fid:
+
+            currLine = line[:-1].split()
+            
+
+            if F2Idx and not(currLine[4] in F2Idx):
+                print('WARNING: font not found...............', line)
+                continue
+            
+            if currLine[4] in self.F2Idx:
+                #IMP: to remove/comment
+
+                if numClasses==-1 or self.F2Idx[currLine[4]] < numClasses:
+                    self.fontIdx.append(self.F2Idx[currLine[4]])
+                    self.imgPath.append(currLine[0])
+            else:
+                
+                self.F2Idx[currLine[4]] = cntr
+                self.Idx2F.append(currLine[4])
+                #IMP: to remove/comment
+                if numClasses==-1 or self.F2Idx[currLine[4]] < numClasses:
+                    self.fontIdx.append(cntr)
+                    self.imgPath.append(currLine[0])
+
+                cntr+=1
+
+        fid.close()
+        
+    def __len__(self):
+        return len(self.imgPath)
+
+    
+    def __getitem__(self, index):
+
+        try:
+            img = Image.open(os.path.join(self.imgDir,self.imgPath[index])).convert('RGB')  # for color image
+            if self.transform:
+                img = self.transform(img)
+        except IOError:
+            print(f'Corrupted image for {index}')
+            # make dummy image and dummy label for corrupted image.
+            img = Image.new('RGB', (256, 64))
+            if self.transform:
+                img = self.transform(img)
+        
+        return img, torch.from_numpy(np.int64([self.fontIdx[index]]))
+
+
+class fontTextDataset(Dataset):
+    def __init__(self, imgDir, annFile, transform=None, F2Idx=None, Idx2F=None, numClasses=-1):
+        self.imgDir = imgDir
+        self.imgPath = []
+        self.fontIdx = []
+        # self.initIdx = False
+        self.transform = transform
+
+        if F2Idx:
+            self.F2Idx=F2Idx
+            self.Idx2F=Idx2F
+            # self.initIdx = True
+        else:   
+            self.F2Idx={}
+            self.Idx2F=[]
+        
+        cntr=0
+        fid = open(annFile,'r')
+
+        for line in fid:
+
+            currLine = line[:-1].split()
+            
+
+            if F2Idx and not(currLine[2] in F2Idx):
+                print('WARNING: font not found...............', line)
+                continue
+            
+            if currLine[2] in self.F2Idx:
+                #IMP: to remove/comment
+
+                if numClasses==-1 or self.F2Idx[currLine[2]] < numClasses:
+                    self.fontIdx.append(self.F2Idx[currLine[2]])
+                    self.imgPath.append(currLine[0])
+            else:
+                
+                self.F2Idx[currLine[2]] = cntr
+                self.Idx2F.append(currLine[2])
+                #IMP: to remove/comment
+                if numClasses==-1 or self.F2Idx[currLine[2]] < numClasses:
+                    self.fontIdx.append(cntr)
+                    self.imgPath.append(currLine[0])
+
+                cntr+=1
+
+        fid.close()
+        
+    def __len__(self):
+        return len(self.imgPath)
+
+    
+    def __getitem__(self, index):
+
+        try:
+            img = Image.open(os.path.join(self.imgDir,self.imgPath[index])).convert('RGB')  # for color image
+            if self.transform:
+                img = self.transform(img)
+        except IOError:
+            print(f'Corrupted image for {index}')
+            # make dummy image and dummy label for corrupted image.
+            img = Image.new('RGB', (256, 64))
+            if self.transform:
+                img = self.transform(img)
+        
+        return img, torch.from_numpy(np.int64([self.fontIdx[index]]))

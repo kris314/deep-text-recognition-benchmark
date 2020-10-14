@@ -18,13 +18,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
+import torchvision
 
 from modules.transformation import TPS_SpatialTransformerNetwork
 from modules.feature_extraction import VGG_FeatureExtractor, RCNN_FeatureExtractor, ResNet_FeatureExtractor
 from modules.sequence_modeling import BidirectionalLSTM
 from modules.prediction import Attention
 from modules.content_encoder import LocalContentEncoder, GlobalContentEncoder
-from modules.word_generator import WordGenerator,MLP, Conv2dBlock, ResBlocks, ResStyleBlocks
+from modules.word_generator import WordGenerator,MLP, Conv2dBlock, ResBlocks, ResStyleBlocks, LinearBlock
 
 
 import pdb
@@ -151,8 +152,10 @@ class ModelV1(nn.Module):
         else:
             raise Exception('Prediction is neither CTC or Attn')
 
-    def forward(self, input, text, is_train=True, returnFeat='pred'):
+    def forward(self, input, text, is_train=True, returnFeat='pred', inAct=None):
         
+        # if inAct == 'tanh':
+        #     input = torch.tanh(input)
         if self.opt.ocr_input_channel == 1 and self.opt.input_channel == 3:
             #rgb2gray conversion
             input = (input[:,0,:,:]*0.21+input[:,1,:,:]*0.72+input[:,1,:,:]*0.07).unsqueeze(1)
@@ -792,6 +795,8 @@ class StyleTensorEncoder(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+
+
 class StyleLatentEncoder(nn.Module):
     def __init__(self, n_downsample=3, n_res=4, input_dim=1, dim=64, norm='bn', activ='lrelu', pad_type='zero'):
         super(StyleLatentEncoder, self).__init__()
@@ -921,6 +926,32 @@ class Mixer(nn.Module):
         return self.mixNet(input)
         
 
+
+class Fusion(nn.Module):
+    def __init__(self, n_downsample=1, n_res=2, input_dim=512*2, dim=512, norm='bn', activ='lrelu', pad_type='zero'):
+        super(Fusion, self).__init__()
+        self.model = []
+        self.model += [Conv2dBlock(input_dim, dim, 3, 1, 1, norm=norm, activation=activ, pad_type=pad_type)]
+        self.model += [Conv2dBlock(dim, dim, 3, 1, 1, norm=norm, activation=activ, pad_type=pad_type)]
+
+        # downsampling blocks
+        for i in range(n_downsample):
+            self.model += [Conv2dBlock(dim, dim, 3, 2, 1, norm=norm, activation=activ, pad_type=pad_type)]
+            self.model += [Conv2dBlock(dim, dim, 3, 1, 1, norm=norm, activation=activ, pad_type=pad_type)]
+
+        # residual blocks
+        self.model += [ResStyleBlocks(n_res, dim, norm=norm, activation=activ, pad_type=pad_type)]
+        self.model = nn.Sequential(*self.model)
+
+        self.linear_model = LinearBlock(4*16*dim, dim, norm='none', activation=activ)
+        self.output_dim = dim
+
+    def forward(self, styleCode, contentCode):
+        
+        x = self.model(torch.cat((styleCode,contentCode), dim=1))
+        x = x.view(-1,4*16*self.output_dim)
+
+        return self.linear_model(x)
 
 
 class MsImageDis(nn.Module):
@@ -1205,7 +1236,9 @@ class MsImageDisV2(nn.Module):
 class VGGPerceptualLossModel(nn.Module):
     def __init__(self, vggmodel, criterion, resize=True):
         super(VGGPerceptualLossModel, self).__init__()
+        
         self.layers = vggmodel.features
+        
         self.layer_mapping = {
             '1':"relu1_1",
             '3':"relu2_1",
@@ -1214,23 +1247,42 @@ class VGGPerceptualLossModel(nn.Module):
             '11':"relu5_1"
         }
 
-        self.mean = torch.nn.Parameter(torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
-        self.std = torch.nn.Parameter(torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
+        self.mean = torch.nn.Parameter(torch.tensor([0.485, 0.456, 0.406])).view(1,3,1,1)
+        self.std = torch.nn.Parameter(torch.tensor([0.229, 0.224, 0.225])).view(1,3,1,1)
+
         self.resize = resize
         self.transform = torch.nn.functional.interpolate
+        # self.normalize = torchvision.transforms.Normalize(mean,std)
         self.loss=criterion
 
-    def forward(self, input, target):
+    def forward(self, input, target, inAct=None, normFlag=True):
         pLoss = [] 
         sLoss = []
-        
+
+        # if inAct == 'tanh':
+        #     input = torch.tanh(input)
         if input.shape[1] != 3:
             input = input.repeat(1, 3, 1, 1)
             target = target.repeat(1, 3, 1, 1)
         
+        
+        input = (input + 1) * 0.5
+        target = (target + 1) * 0.5
+
         if self.resize:
             input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
             target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+        
+        
+        #pre-process
+        if normFlag:
+            if input.is_cuda:
+                input = (input-self.mean.cuda())/self.std.cuda()
+                target = (target-self.mean.cuda())/self.std.cuda()
+            else:
+                input = (input-self.mean)/self.std
+                target = (target-self.mean)/self.std
+        
 
         for name,module in self.layers._modules.items():
             input = module(input)
@@ -1244,3 +1296,21 @@ class VGGPerceptualLossModel(nn.Module):
                 sLoss.append(self.loss(targetGram, inputGram))
               
         return torch.mean(torch.stack(pLoss)), torch.mean(torch.stack(sLoss))
+    
+class VGGFontModel(nn.Module):
+    def __init__(self, vggmodel, numClasses):
+        super(VGGFontModel, self).__init__()
+        
+
+        self.features = vggmodel.features
+        vggmodel.classifier[0]=torch.nn.Linear(2*8*512,4096)
+        vggmodel.classifier[6]=torch.nn.Linear(4096,numClasses)
+        self.classifier = vggmodel.classifier
+
+        
+
+    def forward(self, input):
+        out = self.features(input)
+        out = out.view((-1,2*8*512))
+        out = self.classifier(out)
+        return out
