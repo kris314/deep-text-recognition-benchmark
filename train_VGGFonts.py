@@ -74,30 +74,30 @@ def train(opt):
     lib.print_model_settings(locals().copy())
     
     
-    train_transform =  transforms.Compose([
-        # transforms.RandomResizedCrop(input_size),
-        transforms.Resize((opt.imgH, opt.imgW)),
-        transforms.RandomAffine(degrees=10, translate=(0.1,0.1), scale=None, shear=None, resample=False, fillcolor=0),
-        # transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+    # train_transform =  transforms.Compose([
+    #     # transforms.RandomResizedCrop(input_size),
+    #     transforms.Resize((opt.imgH, opt.imgW)),
+    #     transforms.RandomAffine(degrees=10, translate=(0.1,0.1), scale=None, shear=None, resample=False, fillcolor=0),
+    #     # transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    # ])
     
-    val_transform = transforms.Compose([
-        transforms.Resize((opt.imgH, opt.imgW)),
-        # transforms.CenterCrop(input_size),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+    # val_transform = transforms.Compose([
+    #     transforms.Resize((opt.imgH, opt.imgW)),
+    #     # transforms.CenterCrop(input_size),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    # ])
 
-    # AlignFontCollateObj = AlignFontCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
-    train_dataset = fontDataset(imgDir=opt.train_img_dir, annFile=opt.train_ann_file, transform=train_transform, numClasses=opt.numClasses)
+    AlignFontCollateObj = AlignFontCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
+    train_dataset = fontDataset(imgDir=opt.train_img_dir, annFile=opt.train_ann_file, transform=None, numClasses=opt.numClasses)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=opt.batch_size, 
         shuffle=False,  # 'True' to check training progress with validation function.
         sampler=data_sampler(train_dataset, shuffle=True, distributed=opt.distributed),
         num_workers=int(opt.workers),
-        collate_fn=None, pin_memory=True, drop_last=False)
+        collate_fn=AlignFontCollateObj, pin_memory=True, drop_last=False)
     # numClasses = len(train_dataset.Idx2F)
     numClasses = np.unique(train_dataset.fontIdx).size
     
@@ -106,13 +106,13 @@ def train(opt):
     numTrainSamples = len(train_dataset)
 
     # valid_dataset = LmdbStyleDataset(root=opt.valid_data, opt=opt)
-    valid_dataset = fontDataset(imgDir=opt.train_img_dir, annFile=opt.val_ann_file, transform=val_transform, F2Idx=train_dataset.F2Idx, Idx2F=train_dataset.Idx2F, numClasses=opt.numClasses)
+    valid_dataset = fontDataset(imgDir=opt.train_img_dir, annFile=opt.val_ann_file, transform=None, F2Idx=train_dataset.F2Idx, Idx2F=train_dataset.Idx2F, numClasses=opt.numClasses)
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset, batch_size=opt.batch_size, 
         shuffle=False,  # 'True' to check training progress with validation function.
         sampler=data_sampler(valid_dataset, shuffle=False, distributed=opt.distributed),
         num_workers=int(opt.workers),
-        collate_fn=None, pin_memory=True, drop_last=False)
+        collate_fn=AlignFontCollateObj, pin_memory=True, drop_last=False)
     numTestSamples = len(valid_dataset)
 
     print('numClasses', numClasses)
@@ -412,7 +412,7 @@ if __name__ == '__main__':
     parser.add_argument('--beta1', type=float, default=0.9, help='beta1 for adam. default=0.9')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for adam. default=0.999')
     parser.add_argument('--lr_policy', default='None', help='None|step')
-    parser.add_argument('--step_size', type=int, default=20000, help='step size')
+    parser.add_argument('--step_size', type=int, default=25000, help='step size')
     parser.add_argument('--gamma', type=float, default=0.5, help='how much to decay learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay')
     parser.add_argument('--preTrained', action='store_true', help='for testing')

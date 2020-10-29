@@ -4,6 +4,7 @@ import fire
 import os
 import lmdb
 import cv2
+import pdb
 
 import numpy as np
 
@@ -44,7 +45,8 @@ def createDataset(inputPath, gtFile, outputPath, checkValid=True):
 
     nSamples = len(datalist)
     for i in range(nSamples):
-        imagePath, label = datalist[i].strip('\n').split('\t')
+        # imagePath, label = datalist[i].strip('\n').split('\t')
+        imagePath, label = datalist[i].strip('\n').split(' ')
         imagePath = os.path.join(inputPath, imagePath)
 
         # # only use alphanumeric data

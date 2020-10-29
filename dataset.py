@@ -624,6 +624,172 @@ class LmdbStyleContentDataset(Dataset):
 
         return (img1, img2, label1, label2, label1SynthImg, label2SynthImg)
 
+
+
+class LmdbTestStyleContentDataset(Dataset):
+
+    def __init__(self, root, opt, dataMode=False):
+
+        self.root = root
+        self.opt = opt
+        self.env = lmdb.open(root, max_readers=32, readonly=True, lock=False, readahead=False, meminit=False)
+        
+        self.synthGen = SynthGenerator('/private/home/pkrishnan/fonts/fonts-10-path.txt',imgSize=(64,256))
+
+        if not self.env:
+            print('cannot create lmdb from %s' % (root))
+            sys.exit(0)
+
+        with self.env.begin(write=False) as txn:
+            
+            nSamples = int(txn.get('num-samples'.encode()))
+            self.nSamples = nSamples
+            print('nSamples:::::::::::::',nSamples)
+
+            if self.opt.data_filtering_off:
+                # for fast check or benchmark evaluation with no filtering
+                self.filtered_index_list = [index + 1 for index in range(self.nSamples)]
+            else:
+                """ Filtering part
+                If you want to evaluate IC15-2077 & CUTE datasets which have special character labels,
+                use --data_filtering_off and only evaluate on alphabets and digits.
+                see https://github.com/clovaai/deep-text-recognition-benchmark/blob/6593928855fb7abb999a99f428b3e4477d4ae356/dataset.py#L190-L192
+
+                And if you want to evaluate them with the model trained with --sensitive option,
+                use --sensitive and --data_filtering_off,
+                see https://github.com/clovaai/deep-text-recognition-benchmark/blob/dff844874dbe9e0ec8c5a52a7bd08c7f20afe704/test.py#L137-L144
+                """
+                self.filtered_index_list = []
+                for index in range(self.nSamples):
+                    index += 1  # lmdb starts with 1
+                    if dataMode:
+                        #Todo: remove duplication; simplify
+                        label1_key = 'label-%09d'.encode() % index
+                        label1 = txn.get(label1_key).decode('utf-8')
+
+                        label2_key = 'label-%09d'.encode() % index
+                        label2 = txn.get(label2_key).decode('utf-8')
+                    else:    
+                        label1_key = 'label1-%09d'.encode() % index
+                        label1 = txn.get(label1_key).decode('utf-8')
+
+                        label2_key = 'label2-%09d'.encode() % index
+                        label2 = txn.get(label2_key).decode('utf-8')
+                    
+                    #read image and filter
+                    if dataMode:
+                        img1_key = 'image-%09d'.encode() % index
+                        img1buf = txn.get(img1_key)
+
+                        buf1 = six.BytesIO()
+                        buf1.write(img1buf)
+                        buf1.seek(0)
+
+                        try:
+                            if self.opt.rgb:
+                                img1 = Image.open(buf1).convert('RGB')  # for color image
+                            else:
+                                img1 = Image.open(buf1).convert('L')
+                            
+                            if opt.sizeFilt and (img1.size[1]<opt.imgH_filt or (img1.size[0] < 1.5*img1.size[1])):
+                                continue
+                        except IOError:
+                            print(f'Corrupted image for {index}')
+                            continue
+
+
+                    if self.opt.fixedString and (len(label1) != self.opt.batch_exact_length or len(label2) != self.opt.batch_exact_length) :
+                        continue
+                    elif len(label1) > self.opt.batch_max_length or len(label1)<self.opt.batch_min_length or len(label2) > self.opt.batch_max_length or len(label2)<self.opt.batch_min_length:
+                        # print(f'The length of the label is longer than max_length: length
+                        # {len(label)}, {label} in dataset {self.root}')
+                        continue
+
+                    # By default, images containing characters which are not in opt.character are filtered.
+                    # You can add [UNK] token to `opt.character` in utils.py instead of this filtering.
+                    out_of_char = f'[^{self.opt.character}]'
+                    if re.search(out_of_char, label1.lower()) or re.search(out_of_char, label2.lower()):
+                        continue
+                    
+                    self.filtered_index_list.append(index)
+
+                self.nSamples = len(self.filtered_index_list)
+                print('Filtered nSamples:::::::::::::',self.nSamples)
+                self.realData = dataMode
+
+    def __len__(self):
+        return self.nSamples
+
+    def __getitem__(self, index):
+        assert index <= len(self), 'index range error'
+        index = self.filtered_index_list[index]
+
+        with self.env.begin(write=False) as txn:
+            if self.realData:
+                #todo: remove duplication; simplify
+                label1_key = 'label-%09d'.encode() % index
+                label2_key = 'label-%09d'.encode() % index
+            else:
+                label1_key = 'label1-%09d'.encode() % index
+                label2_key = 'label2-%09d'.encode() % index
+            
+            label1 = txn.get(label1_key).decode('utf-8')
+            label2 = txn.get(label2_key).decode('utf-8')
+            
+            if self.realData:
+                #todo: remove duplication; simplify
+                img1_key = 'image-%09d'.encode() % index
+                img2_key = 'image-%09d'.encode() % index
+            else:
+                img1_key = 'image1-%09d'.encode() % index
+                img2_key = 'image2-%09d'.encode() % index
+
+            img1buf = txn.get(img1_key)
+            img2buf = txn.get(img2_key)
+
+            buf1 = six.BytesIO()
+            buf1.write(img1buf)
+            buf1.seek(0)
+
+            buf2 = six.BytesIO()
+            buf2.write(img2buf)
+            buf2.seek(0)
+
+            try:
+                if self.opt.rgb:
+                    img1 = Image.open(buf1).convert('RGB')  # for color image
+                    img2 = Image.open(buf2).convert('RGB')  # for color image
+                else:
+                    img1 = Image.open(buf1).convert('L')
+                    img2 = Image.open(buf2).convert('L')
+
+            except IOError:
+                print(f'Corrupted image for {index}')
+                # make dummy image and dummy label for corrupted image.
+                if self.opt.rgb:
+                    img1 = Image.new('RGB', (self.opt.imgW, self.opt.imgH))
+                    img2 = Image.new('RGB', (self.opt.imgW, self.opt.imgH))
+                else:
+                    img1 = Image.new('L', (self.opt.imgW, self.opt.imgH))
+                    img2 = Image.new('L', (self.opt.imgW, self.opt.imgH))
+                label1 = '[dummy_label]'
+                label2 = '[dummy_label]'
+
+            if not self.opt.sensitive:
+                label1 = label1.lower()
+                label2 = label2.lower()
+
+            # We only train and evaluate on alphanumerics (or pre-defined character set in train.py)
+            out_of_char = f'[^{self.opt.character}]'
+            label1 = re.sub(out_of_char, '', label1)
+            label2 = re.sub(out_of_char, '', label2)
+            label1SynthImg = self.synthGen.synthesizeWordImage(label1, 0)
+            label2SynthImg = self.synthGen.synthesizeWordImage(label2, 0)
+            
+
+        return (img1, img2, label1, label2, label1SynthImg, label2SynthImg)
+
+
 class RawDataset(Dataset):
 
     def __init__(self, root, opt):
@@ -696,6 +862,26 @@ class NormalizePAD(object):
             Pad_img[:, :, w:] = zero_vec.unsqueeze(2).expand(c, h, self.max_size[2] - w)
         return Pad_img
 
+class NormalizePADVarSize(object):
+
+    def __init__(self, max_size, PAD_type='right'):
+        self.toTensor = transforms.ToTensor()
+        self.max_size = max_size
+        self.max_width_half = math.floor(max_size[2] / 2)
+        self.PAD_type = PAD_type
+
+    def __call__(self, img):
+        img = self.toTensor(img)
+        img.sub_(0.5).div_(0.5)
+        # c, h, w = img.size()
+        # Pad_img = torch.FloatTensor(*self.max_size).fill_(0)
+        # Pad_img[:, :, :w] = img  # right pad
+        
+        # if self.max_size[2] != w:  # add border Pad
+        #     # Pad_img[:, :, w:] = img[:, :, w - 1].unsqueeze(2).expand(c, h, self.max_size[2] - w)
+        #     zero_vec = torch.zeros((img.size()[0],img.size()[1]))
+        #     Pad_img[:, :, w:] = zero_vec.unsqueeze(2).expand(c, h, self.max_size[2] - w)
+        return img
 
 class AlignCollate(object):
 
@@ -890,16 +1076,20 @@ class AlignPairImgCollate(object):
             input_channel = 3 if images1[0].mode == 'RGB' else 1
             transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
 
+            input_channel_synth = 3 if label1SynthImgs[0].mode == 'RGB' else 1
+            transform_synth = NormalizePAD((input_channel_synth, self.imgH, resized_max_w))
+
             resized_images1 = []
             resized_images2 = []
             resized_label1SynthImgs = []
             resized_label2SynthImgs = []
-
+            
             cntr=0
             for image1 in images1:
                 image2=images2[cntr]
                 label1SynthImg=label1SynthImgs[cntr]
                 label2SynthImg=label2SynthImgs[cntr]
+                
 
                 w, h = image1.size
                 ratio = w / float(h)
@@ -916,10 +1106,10 @@ class AlignPairImgCollate(object):
                 resized_images2.append(transform(resized_image2))
 
                 resized_label1SynthImg = label1SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
-                resized_label1SynthImgs.append(transform(resized_label1SynthImg))
+                resized_label1SynthImgs.append(transform_synth(resized_label1SynthImg))
 
                 resized_label2SynthImg = label2SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
-                resized_label2SynthImgs.append(transform(resized_label2SynthImg))
+                resized_label2SynthImgs.append(transform_synth(resized_label2SynthImg))
                 # resized_image.save('./image_test/%d_test.jpg' % w)
                 cntr+=1
 
@@ -939,7 +1129,81 @@ class AlignPairImgCollate(object):
             image_tensors2 = torch.cat([t.unsqueeze(0) for t in image_tensors2], 0)
             label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label1SynthImg_tensors], 0)
             label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label2SynthImg_tensors], 0)
+        # print(image_tensors1.shape)
+        # print(label1SynthImg_tensors.shape)
+        return image_tensors1, image_tensors2, labels1, labels2, label1SynthImg_tensors, label2SynthImg_tensors
 
+class AlignPairImgCollateVarSize(object):
+
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+
+    def __call__(self, batch):
+        batch = filter(lambda x: x is not None, batch)
+        images1, images2, labels1, labels2, label1SynthImgs, label2SynthImgs = zip(*batch)
+
+        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+            resized_max_w = self.imgW
+            input_channel = 3 if images1[0].mode == 'RGB' else 1
+            transform = NormalizePADVarSize((input_channel, self.imgH, resized_max_w))
+
+            input_channel_synth = 3 if label1SynthImgs[0].mode == 'RGB' else 1
+            transform_synth = NormalizePADVarSize((input_channel_synth, self.imgH, resized_max_w))
+
+            resized_images1 = []
+            resized_images2 = []
+            resized_label1SynthImgs = []
+            resized_label2SynthImgs = []
+            
+            cntr=0
+            for image1 in images1:
+                image2=images2[cntr]
+                label1SynthImg=label1SynthImgs[cntr]
+                label2SynthImg=label2SynthImgs[cntr]
+                
+
+                w, h = image1.size
+                ratio = w / float(h)
+                if math.ceil(self.imgH * ratio) > self.imgW:
+                    resized_w = self.imgW
+                else:
+                    resized_w = math.ceil(self.imgH * ratio)
+
+                resized_image1 = image1.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images1.append(transform(resized_image1))
+                
+                #resizing image2 w.r.t image1 dimensions
+                resized_image2 = image2.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images2.append(transform(resized_image2))
+
+                resized_label1SynthImg = label1SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label1SynthImgs.append(transform_synth(resized_label1SynthImg))
+
+                resized_label2SynthImg = label2SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label2SynthImgs.append(transform_synth(resized_label2SynthImg))
+                # resized_image.save('./image_test/%d_test.jpg' % w)
+                cntr+=1
+
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in resized_images1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in resized_images2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label1SynthImgs], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label2SynthImgs], 0)
+
+        else:
+            transform = ResizeNormalize((self.imgW, self.imgH))
+            image_tensors1 = [transform(image) for image in images1]
+            image_tensors2 = [transform(image) for image in images2]
+            
+            label1SynthImg_tensors = [transform(image) for image in label1SynthImgs]
+            label2SynthImg_tensors = [transform(image) for image in label2SynthImgs]
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in image_tensors1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in image_tensors2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label1SynthImg_tensors], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label2SynthImg_tensors], 0)
+        # print(image_tensors1.shape)
+        # print(label1SynthImg_tensors.shape)
         return image_tensors1, image_tensors2, labels1, labels2, label1SynthImg_tensors, label2SynthImg_tensors
 
 def tensor2im(image_tensor, imtype=np.uint8):

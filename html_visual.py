@@ -46,7 +46,7 @@ class HTML:
         with self.doc:
             h3(text)
 
-    def add_images(self, ims, txts, width=400):
+    def add_images(self, ims, txts, width=400, realFlag=False):
         """add images to the HTML file
 
         Parameters:
@@ -57,8 +57,8 @@ class HTML:
         self.t = table(border=1, style="table-layout: fixed;")  # Insert a table
         self.doc.add(self.t)
         with self.t:
-            with tr():
-                for im, txt in zip(ims, txts):
+            for im, txt in zip(ims, txts):
+                with tr():
                     with td(style="word-wrap: break-word;", halign="center", valign="top"):
                         with p():
                             # with a(href=os.path.join('images', link)):
@@ -75,14 +75,15 @@ class HTML:
                             img(style="width:%dpx" % width, src=im[1])
                             br()
                             p(txt[1])
-                    with td(style="word-wrap: break-word;", halign="center", valign="top"):
-                        with p():
-                            # with a(href=os.path.join('images', link)):
-                            # with a(href=os.path.join(link)):
-                            #     # img(style="width:%dpx" % width, src=os.path.join('images', im))
-                            img(style="width:%dpx" % width, src=im[2])
-                            br()
-                            p(txt[2])
+                    if not(realFlag):
+                        with td(style="word-wrap: break-word;", halign="center", valign="top"):
+                            with p():
+                                # with a(href=os.path.join('images', link)):
+                                # with a(href=os.path.join(link)):
+                                #     # img(style="width:%dpx" % width, src=os.path.join('images', im))
+                                img(style="width:%dpx" % width, src=im[2])
+                                br()
+                                p(txt[2])
                     with td(style="word-wrap: break-word;", halign="center", valign="top"):
                         with p():
                             # with a(href=os.path.join('images', link)):

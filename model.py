@@ -1296,7 +1296,88 @@ class VGGPerceptualLossModel(nn.Module):
                 sLoss.append(self.loss(targetGram, inputGram))
               
         return torch.mean(torch.stack(pLoss)), torch.mean(torch.stack(sLoss))
-    
+
+
+class VGGPerceptualEmbedLossModel(nn.Module):
+    def __init__(self, vggmodel, criterion, resize=True):
+        super(VGGPerceptualEmbedLossModel, self).__init__()
+        
+        self.layers = vggmodel.features
+        self.embed = vggmodel.classifier
+        
+        self.layer_mapping = {
+            '1':"relu1_1",
+            '3':"relu2_1",
+            '6':"relu3_1",
+            '8':"relu4_1",
+            '11':"relu5_1"
+        }
+
+        self.embed_mapping = {
+            '4':"relu2_1",
+        }
+
+        self.mean = torch.nn.Parameter(torch.tensor([0.485, 0.456, 0.406])).view(1,3,1,1)
+        self.std = torch.nn.Parameter(torch.tensor([0.229, 0.224, 0.225])).view(1,3,1,1)
+
+        self.resize = resize
+        self.transform = torch.nn.functional.interpolate
+        # self.normalize = torchvision.transforms.Normalize(mean,std)
+        self.loss=criterion
+
+    def forward(self, input, target, inAct=None, normFlag=True):
+        pLoss = [] 
+        sLoss = []
+        eLoss = []
+
+        # if inAct == 'tanh':
+        #     input = torch.tanh(input)
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+        
+        
+        input = (input + 1) * 0.5
+        target = (target + 1) * 0.5
+
+        if self.resize:
+            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
+            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+        
+        
+        #pre-process
+        if normFlag:
+            if input.is_cuda:
+                input = (input-self.mean.cuda())/self.std.cuda()
+                target = (target-self.mean.cuda())/self.std.cuda()
+            else:
+                input = (input-self.mean)/self.std
+                target = (target-self.mean)/self.std
+        
+        
+        for name,module in self.layers._modules.items():
+            input = module(input)
+            target = module(target)
+            
+            _,c,h,w = input.shape
+            if name in self.layer_mapping:
+                pLoss.append(self.loss(target, input))
+                inputGram = (1/(h*w*c)) * torch.matmul(input.reshape(-1,c,h*w), input.reshape(-1,c,h*w).transpose(1,2))
+                targetGram = (1/(h*w*c)) * torch.matmul(target.reshape(-1,c,h*w), target.reshape(-1,c,h*w).transpose(1,2))
+                sLoss.append(self.loss(targetGram, inputGram))
+        
+        input = input.view((-1,2*8*512))
+        target = target.view((-1,2*8*512))
+        for name,module in self.embed._modules.items():
+            input = module(input)
+            target = module(target)
+            
+            if name in self.embed_mapping:
+                eLoss.append(self.loss(target, input))
+        
+        return torch.mean(torch.stack(pLoss)), torch.mean(torch.stack(sLoss)), torch.mean(torch.stack(eLoss))
+
+
 class VGGFontModel(nn.Module):
     def __init__(self, vggmodel, numClasses):
         super(VGGFontModel, self).__init__()
