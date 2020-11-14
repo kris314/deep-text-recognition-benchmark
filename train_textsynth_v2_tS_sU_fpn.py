@@ -31,7 +31,7 @@ from dataset import hierarchical_dataset, AlignPairCollate, AlignPairImgCollate,
 # from model import ModelV1, StyleTensorEncoder, StyleLatentEncoder, MsImageDisV2, AdaIN_Tensor_WordGenerator, VGGPerceptualLossModel, Mixer
 from model import ModelV1, GlobalContentEncoder, VGGPerceptualEmbedLossModel, VGGFontModel
 # from test_synth import validation_synth_v7
-from modules.feature_extraction import ResNet_StyleExtractor, VGG_ContentExtractor, ResNet_StyleExtractor_WIN
+from modules.feature_extraction import ResNet_StyleExtractor, VGG_ContentExtractor, ResNet_StyleExtractor_WIN, ResNet_StyleExtractor_FPN
 
 import tflib as lib
 import tflib.plot
@@ -44,7 +44,7 @@ try:
 except ImportError:
     wandb = None
 
-from model_word import GeneratorM2V4_5 as styleGANGen 
+from model_word import GeneratorM2V4_7 as styleGANGen 
 from model_word import EncDiscriminator as styleGANDis  
 from non_leaking import augment
 from distributed import (
@@ -247,7 +247,8 @@ def train(opt):
         if opt.styleNorm == 'in':
             styleModel = ResNet_StyleExtractor_WIN(opt.input_channel, opt.style_latent).to(device)
         else:
-            styleModel = ResNet_StyleExtractor(opt.input_channel, opt.style_latent).to(device)
+            # styleModel = ResNet_StyleExtractor(opt.input_channel, opt.style_latent).to(device)
+            styleModel = ResNet_StyleExtractor_FPN(opt.input_channel, opt.style_latent).to(device)
         ocrModel = ModelV1(opt).to(device)
 
         # #temp
@@ -372,7 +373,6 @@ def train(opt):
         if not opt.zAlone:
             cEncoder.load_state_dict(checkpoint['cEncoder'])
             styleModel.load_state_dict(checkpoint['styleModel'])
-            print('loading pretrained ocr model from synth checkpoint')
             ocrModel.load_state_dict(checkpoint['ocrModel'])
         genModel.load_state_dict(checkpoint['genModel'])
         g_ema.load_state_dict(checkpoint['g_ema'])
@@ -597,10 +597,10 @@ def train(opt):
                 
                 style = styleModel(image_input_tensors)
             
-            if opt.noiseConcat or opt.zAlone:
-                style = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style)
-            else:
-                style = [style]
+            # if opt.noiseConcat or opt.zAlone:
+            #     style = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style)
+            # else:
+            #     style = [style]
             # print('Before genModel')
             
             fake_img,_ = genModel(style, z_c_code, input_is_latent=opt.input_latent)
@@ -733,10 +733,10 @@ def train(opt):
                 # print('after generator styleModel')
                 
 
-            if opt.noiseConcat or opt.zAlone:
-                style = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style)
-            else:
-                style = [style]
+            # if opt.noiseConcat or opt.zAlone:
+            #     style = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style)
+            # else:
+            #     style = [style]
             
             # fake_img,_ = genModel(style, z_c_code, input_is_latent=opt.input_latent)
             fake_gt_img,_ = genModel(style, z_gt_code, input_is_latent=opt.input_latent)
@@ -789,10 +789,10 @@ def train(opt):
                     
                     style_fake = styleModel(fake_gt_img)
 
-                    if opt.noiseConcat or opt.zAlone:
-                        style_fake = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style_fake)
-                    else:
-                        style_fake = [style_fake]
+                    # if opt.noiseConcat or opt.zAlone:
+                    #     style_fake = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style_fake)
+                    # else:
+                    #     style_fake = [style_fake]
                     fake_recon_img, _ = genModel(style_fake, z_gt_code, input_is_latent=opt.input_latent)
                     cycleReconCost = reconCriterion(fake_recon_img, image_input_tensors)
                 else:
@@ -943,10 +943,10 @@ def train(opt):
                     # print('after g_regularize styleModel')
                     
                 
-                if opt.noiseConcat or opt.zAlone:
-                    style = mixing_noise(path_batch_size, opt.latent, opt.mixing, device, style)
-                else:
-                    style = [style]
+                # if opt.noiseConcat or opt.zAlone:
+                #     style = mixing_noise(path_batch_size, opt.latent, opt.mixing, device, style)
+                # else:
+                #     style = [style]
                 
 
                 fake_gt_img, latents = genModel(style, z_gt_code, return_latents=True, input_is_latent=opt.input_latent)
@@ -1081,11 +1081,11 @@ def train(opt):
                             style = styleModel(image_input_tensors)
                             # style_2 = styleModel(gt_image_tensors_2)
                         
-                        if opt.noiseConcat or opt.zAlone:
-                            style = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style)
-                            # style_2 = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style_2)
-                        else:
-                            style = [style]
+                        # if opt.noiseConcat or opt.zAlone:
+                        #     style = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style)
+                        #     # style_2 = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style_2)
+                        # else:
+                        #     style = [style]
                             # style_2 = [style_2]
                         # print('inside valoidatoin before genModel c1 s1')
                         
@@ -1342,7 +1342,6 @@ def train(opt):
                         
                         loss_log = f'[{iteration+1}/{opt.num_iter}]  \
                             Train Dis loss: {loss_avg_dis.val():0.5f}, Train Gen loss: {loss_avg_gen.val():0.5f},\
-                            Train Sup OCR loss: {loss_avg_ocr_sup.val():0.5f}, \
                             Train UnSup OCR loss: {loss_avg_ocr_unsup.val():0.5f}, \
                             Train Image Recon loss: {loss_avg_img_recon.val():0.5f}, \
                             Train Cycle Recon loss: {loss_avg_cycle_recon.val():0.5f}, \
@@ -1360,7 +1359,6 @@ def train(opt):
                         #plotting
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Dis-Loss'), loss_avg_dis.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Gen-Loss'), loss_avg_gen.val().item())
-                        lib.plot.plot(os.path.join(opt.plotDir,'Train-Sup-OCR-Loss'), loss_avg_ocr_sup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-UnSup-OCR-Loss'), loss_avg_ocr_unsup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-ImageRecon-Loss'), loss_avg_img_recon.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-CycleRecon-Loss'), loss_avg_cycle_recon.val().item())

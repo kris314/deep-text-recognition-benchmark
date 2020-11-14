@@ -44,7 +44,7 @@ try:
 except ImportError:
     wandb = None
 
-from model_word import GeneratorM2V4_5 as styleGANGen 
+from model_word import GeneratorM2V4_5_mask as styleGANGen 
 from model_word import EncDiscriminator as styleGANDis  
 from non_leaking import augment
 from distributed import (
@@ -372,7 +372,6 @@ def train(opt):
         if not opt.zAlone:
             cEncoder.load_state_dict(checkpoint['cEncoder'])
             styleModel.load_state_dict(checkpoint['styleModel'])
-            print('loading pretrained ocr model from synth checkpoint')
             ocrModel.load_state_dict(checkpoint['ocrModel'])
         genModel.load_state_dict(checkpoint['genModel'])
         g_ema.load_state_dict(checkpoint['g_ema'])
@@ -490,6 +489,7 @@ def train(opt):
     log_ada_aug_p = Averager()
     loss_avg_ocr_sup = Averager()
     loss_avg_ocr_unsup = Averager()
+    loss_avg_ocr_mask = Averager()
     loss_avg_style_ucode = Averager()
     loss_avg_style_scode = Averager()
     loss_avg_img_recon = Averager()
@@ -568,6 +568,7 @@ def train(opt):
             # gt_image_tensors = image_input_tensors.detach()    #exemplar word style image; training OCR
             # real_image_tensors = image_input_tensors.detach()  #discriminator
             synth_z_c = synth_z_c.to(device)
+            labelSynthImg = labelSynthImg.to(device)
 
             # labels_gt = labels[:opt.batch_size]
             
@@ -603,7 +604,7 @@ def train(opt):
                 style = [style]
             # print('Before genModel')
             
-            fake_img,_ = genModel(style, z_c_code, input_is_latent=opt.input_latent)
+            fake_img,_,_ = genModel(image_input_tensors, style, z_c_code, input_is_latent=opt.input_latent)
             # print('After genModel')
               
             #unsupervised style code prediction on generated image using StyleEncoder/Discriminator
@@ -739,11 +740,11 @@ def train(opt):
                 style = [style]
             
             # fake_img,_ = genModel(style, z_c_code, input_is_latent=opt.input_latent)
-            fake_gt_img,_ = genModel(style, z_gt_code, input_is_latent=opt.input_latent)
+            fake_c_img,_, fake_c_img_bin = genModel(image_input_tensors, style, z_c_code, input_is_latent=opt.input_latent)
             # print('after generator genModel')
             
 
-            fake_pred = disEncModel(fake_gt_img)
+            fake_pred = disEncModel(fake_c_img)
             disGenCost = g_nonsaturating_loss(fake_pred)
             # print('after generator disModel')
             
@@ -758,27 +759,39 @@ def train(opt):
             else:
                 #Compute OCR prediction (Reconstruction of content)
                 if 'CTC' in opt.Prediction:
-                    preds_recon = ocrModel(fake_gt_img, text_gt, is_train=False, inAct = opt.taskActivation)
+                    preds_recon = ocrModel(fake_c_img, text_z_c, is_train=False, inAct = opt.taskActivation)
                     preds_size = torch.IntTensor([preds_recon.size(1)] * opt.batch_size)
                     preds_recon_softmax = preds_recon.log_softmax(2).permute(1, 0, 2)
-                    ocrCost = ocrCriterion(preds_recon_softmax, text_gt, preds_size, length_gt)
+                    ocrCost = ocrCriterion(preds_recon_softmax, text_z_c, preds_size, length_gt)
+
+                    preds_recon_bin = ocrModel((fake_c_img_bin-0.5)/0.5, text_z_c, is_train=False, inAct = opt.taskActivation)
+                    preds_size_bin = torch.IntTensor([preds_recon_bin.size(1)] * opt.batch_size)
+                    preds_recon_softmax_bin = preds_recon_bin.log_softmax(2).permute(1, 0, 2)
+                    ocrCost_mask = ocrCriterion(preds_recon_softmax_bin, text_z_c, preds_size_bin, length_z_c)
 
                 else:
-                    preds_recon = ocrModel(fake_gt_img, text_gt[:, :-1], is_train=False, inAct = opt.taskActivation)  # align with Attention.forward
-                    target = text_gt[:, 1:]  # without [GO] Symbol
+                    preds_recon = ocrModel(fake_c_img, text_z_c[:, :-1], is_train=False, inAct = opt.taskActivation)  # align with Attention.forward
+                    target = text_z_c[:, 1:]  # without [GO] Symbol
                     ocrCost = ocrCriterion(preds_recon.view(-1, preds_recon.shape[-1]), target.contiguous().view(-1))
+
+                    preds_recon_bin = ocrModel((fake_c_img_bin-0.5)/0.5, text_z_c[:, :-1], is_train=False, inAct = opt.taskActivation)  # align with Attention.forward
+                    target = text_z_c[:, 1:]  # without [GO] Symbol
+                    ocrCost_mask = ocrCriterion(preds_recon_bin.view(-1, preds_recon_bin.shape[-1]), target.contiguous().view(-1))
                     # print("Not implemented error")
                     # sys.exit()
                 # print('after generator ocrModel')
                 
                 if opt.gamma_g>0.0:
-                    uPred_style_code = disEncModel(fake_gt_img, mode='enc')
+                    uPred_style_code = disEncModel(fake_c_img, mode='enc')
                     uCost = reconCriterion(uPred_style_code, style[0][:opt.latent])
                 else:
                     uCost = torch.tensor(0.0)
                 
                 if opt.reconWeight>0.0:
-                    imgReconCost = reconCriterion(fake_gt_img, image_input_tensors)
+                    fake_gt_img,_, fake_gt_img_bin = genModel(image_input_tensors, style, z_gt_code, input_is_latent=opt.input_latent)
+                    # imgReconCost = reconCriterion(fake_gt_img, image_input_tensors)
+                    # imgReconCost = 0.5*(reconCriterion(fake_gt_img*torch.round(fake_gt_img_bin), image_input_tensors*torch.round(fake_gt_img_bin)) + reconCriterion(fake_gt_img*torch.round(1-fake_gt_img_bin), image_input_tensors*torch.round(1-fake_gt_img_bin)))
+                    imgReconCost = 0.5*(reconCriterion(fake_gt_img*(fake_gt_img_bin), image_input_tensors*(fake_gt_img_bin)) + reconCriterion(fake_gt_img*(1-fake_gt_img_bin), image_input_tensors*(1-fake_gt_img_bin)))
                 else:
                     imgReconCost = torch.tensor(0.0)
                 
@@ -787,14 +800,16 @@ def train(opt):
                 
                 if opt.cycleReconWeight > 0.0:
                     
-                    style_fake = styleModel(fake_gt_img)
+                    style_fake = styleModel(fake_c_img)
 
                     if opt.noiseConcat or opt.zAlone:
                         style_fake = mixing_noise(opt.batch_size, opt.latent, opt.mixing, device, style_fake)
                     else:
                         style_fake = [style_fake]
-                    fake_recon_img, _ = genModel(style_fake, z_gt_code, input_is_latent=opt.input_latent)
-                    cycleReconCost = reconCriterion(fake_recon_img, image_input_tensors)
+                    fake_recon_img, _, fake_recon_img_bin = genModel(fake_c_img, style_fake, z_gt_code, input_is_latent=opt.input_latent)
+                    # cycleReconCost = reconCriterion(fake_recon_img, image_input_tensors)
+                    # cycleReconCost = 0.5*(reconCriterion(fake_recon_img*torch.round(fake_recon_img_bin), image_input_tensors*torch.round(fake_recon_img_bin))+reconCriterion(fake_recon_img*torch.round(1-fake_recon_img_bin), image_input_tensors*torch.round(1-fake_recon_img_bin)))
+                    cycleReconCost = 0.5*(reconCriterion(fake_recon_img*(fake_recon_img_bin), image_input_tensors*(fake_recon_img_bin))+reconCriterion(fake_recon_img*(1-fake_recon_img_bin), image_input_tensors*(1-fake_recon_img_bin)))
                 else:
                     cycleReconCost = torch.tensor(0.0)
                 
@@ -802,7 +817,7 @@ def train(opt):
                 
                 
                 if opt.vggPerWeight>0.0 or opt.vggStyWeight>0.0 or opt.vggEmbWeight>0.0:
-                    vggPerCost , vggStyCost, vggEmbCost  = vggModel(fake_gt_img, image_input_tensors, inAct=opt.taskActivation, normFlag=not(opt.vggNoMean))
+                    vggPerCost , vggStyCost, vggEmbCost  = vggModel(fake_c_img, image_input_tensors, inAct=opt.taskActivation, normFlag=not(opt.vggNoMean))
                 else:
                     vggPerCost = torch.tensor(0.0)
                     vggStyCost = torch.tensor(0.0)
@@ -816,7 +831,7 @@ def train(opt):
                 styleModel.zero_grad()
                 cEncoder.zero_grad()
 
-            gen_enc_cost = disGenCost + opt.ocrWeight * ocrCost + opt.gamma_g * uCost \
+            gen_enc_cost = disGenCost + opt.ocrWeight * ocrCost + opt.ocrMaskWeight * ocrCost_mask + opt.gamma_g * uCost \
                             + opt.reconWeight * imgReconCost +  opt.vggPerWeight * vggPerCost \
                             +  opt.vggStyWeight * vggStyCost +  opt.vggEmbWeight * vggEmbCost \
                             + opt.cycleReconWeight * cycleReconCost
@@ -824,10 +839,13 @@ def train(opt):
             gen_enc_cost.backward()
             # print('after generator backward')
             
-
-            loss_recon_train.add(reconCriterion(fake_gt_img, image_input_tensors))
+            if opt.reconWeight>0.0:
+                loss_recon_train.add(reconCriterion(fake_gt_img, image_input_tensors))
+            else:
+                loss_recon_train.add(torch.tensor(0.0))
             loss_avg_gen.add(disGenCost)
             loss_avg_ocr_unsup.add(opt.ocrWeight * ocrCost)
+            loss_avg_ocr_mask.add(opt.ocrMaskWeight * ocrCost_mask)
             loss_avg_style_scode.add(opt.gamma_g * uCost)
             loss_avg_img_recon.add(opt.reconWeight * imgReconCost)
             loss_avg_cycle_recon.add(opt.cycleReconWeight * cycleReconCost)
@@ -853,33 +871,34 @@ def train(opt):
                     #run OCR prediction for gen image (content: gt from input_image_tensors)
                     if 'CTC' in opt.Prediction:
                         _, preds_index = preds_recon.max(2)
-                        preds_str_fake_gt_img = converter.decode(preds_index.data, preds_size.data)
+                        preds_str_fake_c_img = converter.decode(preds_index.data, preds_size.data)
                     else:
                         
                         _, preds_index = preds_recon.max(2)
-                        preds_str_fake_gt_img = converter.decode(preds_index, length_for_pred)
-                        for idx, pred in enumerate(preds_str_fake_gt_img):
+                        preds_str_fake_c_img = converter.decode(preds_index, length_for_pred)
+                        for idx, pred in enumerate(preds_str_fake_c_img):
                             pred_EOS = pred.find('[s]')
-                            preds_str_fake_gt_img[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+                            preds_str_fake_c_img[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
 
                     #render target style image using paired content
                     g_ema.eval()
                     with torch.no_grad():
-                        fake_sty_img, _ = g_ema(style, z_c_code, input_is_latent=opt.input_latent)
+                        # fake_sty_img, _,fake_sty_img_bin = g_ema(image_input_tensors, style, z_c_code, input_is_latent=opt.input_latent)
 
-                    if 'CTC' in opt.Prediction:
-                        preds = ocrModel(fake_sty_img, text_z_c, is_train=False, inAct = opt.taskActivation)
-                        preds_size = torch.IntTensor([preds.size(1)] * opt.batch_size)
-                        _, preds_index = preds.max(2)
-                        preds_str_fake_sty_img = converter.decode(preds_index.data, preds_size.data)
-                    else:
-                        
-                        preds = ocrModel(fake_sty_img, text_z_c[:, :-1], is_train=False, inAct = opt.taskActivation)  # align with Attention.forward
-                        _, preds_index = preds.max(2)
-                        preds_str_fake_sty_img = converter.decode(preds_index, length_for_pred)
-                        for idx, pred in enumerate(preds_str_fake_sty_img):
-                            pred_EOS = pred.find('[s]')
-                            preds_str_fake_sty_img[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+                        if opt.reconWeight>0.0:
+                            if 'CTC' in opt.Prediction:
+                                preds = ocrModel(fake_gt_img, text_gt, is_train=False, inAct = opt.taskActivation)
+                                preds_size = torch.IntTensor([preds.size(1)] * opt.batch_size)
+                                _, preds_index = preds.max(2)
+                                preds_str_fake_gt_img = converter.decode(preds_index.data, preds_size.data)
+                            else:
+                                
+                                preds = ocrModel(fake_gt_img, text_gt[:, :-1], is_train=False, inAct = opt.taskActivation)  # align with Attention.forward
+                                _, preds_index = preds.max(2)
+                                preds_str_fake_gt_img = converter.decode(preds_index, length_for_pred)
+                                for idx, pred in enumerate(preds_str_fake_gt_img):
+                                    pred_EOS = pred.find('[s]')
+                                    preds_str_fake_gt_img[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
                     
                     if opt.cycleReconWeight>0.0:
                         if 'CTC' in opt.Prediction:
@@ -902,10 +921,14 @@ def train(opt):
                                 utils.save_image(image_output_tensors[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_z_orig_'+labels_z_c[trImgCntr]+'_ocr:None'+'.png'),nrow=1,normalize=True,range=(-1, 1))
                             if opt.cEncode == 'cnn':
                                 utils.save_image(synth_z_c[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_synth_'+labels_z_c[trImgCntr]+'_ocr:None'+'.png'),nrow=1,normalize=True,range=(-1, 1))
-                            utils.save_image(fake_gt_img[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_gt_recon_pred_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_fake_gt_img[trImgCntr]+'_sty:'+labels_gt[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
-                            # if opt.reconWeight>0.0:
+                            if opt.reconWeight>0.0:
+                                utils.save_image(fake_gt_img[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_gt_recon_pred_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_fake_gt_img[trImgCntr]+'_sty:'+labels_gt[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                                utils.save_image(fake_gt_img_bin[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_gt_recon_predBin_'+labels_gt[trImgCntr]+'_ocr:None_sty:'+labels_gt[trImgCntr]+'.png'),nrow=1,normalize=True,range=(0, 1))
+                            
+                            
                             utils.save_image(image_input_tensors[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_gt_orig_'+labels_gt[trImgCntr]+'_ocr:None'+'.png'),nrow=1,normalize=True,range=(-1, 1))
-                            utils.save_image(fake_sty_img[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_z_pred_'+labels_z_c[trImgCntr]+'_ocr:'+preds_str_fake_sty_img[trImgCntr]+'_sty:'+labels_gt[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                            utils.save_image(fake_c_img[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_z_pred_'+labels_z_c[trImgCntr]+'_ocr:'+preds_str_fake_c_img[trImgCntr]+'_sty:'+labels_gt[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                            utils.save_image(fake_c_img_bin[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_z_predBin_'+labels_z_c[trImgCntr]+'_ocr:None_sty:'+labels_gt[trImgCntr]+'.png'),nrow=1,normalize=True,range=(0, 1))
                             if opt.cycleReconWeight>0.0:
                                 utils.save_image(fake_recon_img[trImgCntr],os.path.join(opt.trainDir,str(iteration),str(trImgCntr)+'_tr_gt_cycle_pred_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_fake_recon_img[trImgCntr]+'_sty:'+labels_gt[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
                         except:
@@ -930,13 +953,13 @@ def train(opt):
                 text_gt, length_gt = converter.encode(labels_gt[:path_batch_size], batch_max_length=opt.batch_max_length)
                 
                 if opt.zAlone:
-                    z_gt_code = None
+                    z_c_code = None
                     style = None
                 else:
                     if opt.cEncode == 'mlp':    
-                        z_gt_code = cEncoder(text_gt)
+                        z_c_code = cEncoder(text_z_c)
                     elif opt.cEncode == 'cnn':    
-                        z_gt_code = cEncoder(labelSynthImg)
+                        z_c_code = cEncoder(synth_z_c)
                     # print('after g_regularize cEncoder')
                     
                     style = styleModel(image_input_tensors)
@@ -949,9 +972,9 @@ def train(opt):
                     style = [style]
                 
 
-                fake_gt_img, latents = genModel(style, z_gt_code, return_latents=True, input_is_latent=opt.input_latent)
+                fake_c_img, latents, fake_c_img_bin = genModel(image_input_tensors, style, z_c_code, return_latents=True, input_is_latent=opt.input_latent)
                 path_loss, mean_path_length, path_lengths = g_path_regularize(
-                    fake_gt_img, latents, mean_path_length
+                    fake_c_img, latents, mean_path_length
                 )
                 # print('after g_regularize genModel')
                 
@@ -962,7 +985,7 @@ def train(opt):
                 weighted_path_loss = opt.path_regularize * opt.g_reg_every * path_loss
 
                 if opt.path_batch_shrink:
-                    weighted_path_loss += 0 * fake_gt_img[0, 0, 0, 0]
+                    weighted_path_loss += 0 * fake_c_img[0, 0, 0, 0] * fake_c_img_bin[0, 0, 0, 0]
 
                 weighted_path_loss.backward()
                 # print('after g_regularize backward')
@@ -993,6 +1016,7 @@ def train(opt):
                         "Generator": loss_avg_gen.val().item(),
                         "Discriminator": loss_avg_dis.val().item(),
                         "Train-UnSup-OCR-Loss": loss_avg_ocr_unsup.val().item(),
+                        "Train-Mask-OCR-Loss": loss_avg_ocr_mask.val().item(),
                         "Train-ImageRecon-Loss": loss_avg_img_recon.val().item(),
                         "Train-CycleRecon-Loss": loss_avg_cycle_recon.val().item(),
                         "Train-VGGPer-Loss": loss_avg_vgg_per.val().item(),
@@ -1089,11 +1113,11 @@ def train(opt):
                             # style_2 = [style_2]
                         # print('inside valoidatoin before genModel c1 s1')
                         
-                        fake_img_c1_s1, _ = g_ema(style, z_gt_code, input_is_latent=opt.input_latent)
+                        fake_img_c1_s1, _, fake_img_c1_s1_bin = g_ema(image_input_tensors, style, z_gt_code, input_is_latent=opt.input_latent)
                         # print('inside valoidatoin after genModel c1 s1')
                         
                         if not opt.zAlone:
-                            fake_img_c2_s1, _ = g_ema(style, z_c_code, input_is_latent=opt.input_latent)
+                            fake_img_c2_s1, _, fake_img_c2_s1_bin = g_ema(image_input_tensors, style, z_c_code, input_is_latent=opt.input_latent)
                             if not(opt.realVaData):
                                 loss_recon_val.add(reconCriterion(fake_img_c2_s1, image_output_tensors)) 
                             else:
@@ -1108,10 +1132,20 @@ def train(opt):
                                 _, preds_index = preds.max(2)
                                 preds_str_fake_img_c1_s1 = converter.decode(preds_index.data, preds_size.data)
 
+                                preds = ocrModel(fake_img_c1_s1_bin, text_gt, is_train=False, inAct = opt.taskActivation)
+                                preds_size = torch.IntTensor([preds.size(1)] * opt.batch_size)
+                                _, preds_index = preds.max(2)
+                                preds_str_fake_img_c1_s1_bin = converter.decode(preds_index.data, preds_size.data)
+
                                 preds = ocrModel(fake_img_c2_s1, text_z_c, is_train=False, inAct = opt.taskActivation)
                                 preds_size = torch.IntTensor([preds.size(1)] * opt.batch_size)
                                 _, preds_index = preds.max(2)
                                 preds_str_fake_img_c2_s1 = converter.decode(preds_index.data, preds_size.data)
+
+                                preds = ocrModel(fake_img_c2_s1_bin, text_z_c, is_train=False, inAct = opt.taskActivation)
+                                preds_size = torch.IntTensor([preds.size(1)] * opt.batch_size)
+                                _, preds_index = preds.max(2)
+                                preds_str_fake_img_c2_s1_bin = converter.decode(preds_index.data, preds_size.data)
 
                                 preds = ocrModel(image_input_tensors, text_gt, is_train=False)
                                 preds_size = torch.IntTensor([preds.size(1)] * image_input_tensors.shape[0])
@@ -1131,6 +1165,13 @@ def train(opt):
                                 for idx, pred in enumerate(preds_str_fake_img_c1_s1):
                                     pred_EOS = pred.find('[s]')
                                     preds_str_fake_img_c1_s1[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+
+                                preds = ocrModel(fake_img_c1_s1_bin, text_gt[:, :-1], is_train=False, inAct = opt.taskActivation)  # align with Attention.forward
+                                _, preds_index = preds.max(2)
+                                preds_str_fake_img_c1_s1_bin = converter.decode(preds_index, length_for_pred)
+                                for idx, pred in enumerate(preds_str_fake_img_c1_s1_bin):
+                                    pred_EOS = pred.find('[s]')
+                                    preds_str_fake_img_c1_s1_bin[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
                                 
                                 preds = ocrModel(fake_img_c2_s1, text_z_c[:, :-1], is_train=False, inAct = opt.taskActivation)  # align with Attention.forward
                                 _, preds_index = preds.max(2)
@@ -1139,7 +1180,13 @@ def train(opt):
                                     pred_EOS = pred.find('[s]')
                                     preds_str_fake_img_c2_s1[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
                                 
-
+                                preds = ocrModel(fake_img_c2_s1_bin, text_z_c[:, :-1], is_train=False, inAct = opt.taskActivation)  # align with Attention.forward
+                                _, preds_index = preds.max(2)
+                                preds_str_fake_img_c2_s1_bin = converter.decode(preds_index, length_for_pred)
+                                for idx, pred in enumerate(preds_str_fake_img_c2_s1_bin):
+                                    pred_EOS = pred.find('[s]')
+                                    preds_str_fake_img_c2_s1_bin[idx] = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+                                
                                 preds = ocrModel(image_input_tensors, text_gt[:, :-1], is_train=False)  # align with Attention.forward
                                 _, preds_index = preds.max(2)
                                 preds_str_gt_1 = converter.decode(preds_index, length_for_pred)
@@ -1261,27 +1308,32 @@ def train(opt):
                                 #     iCntr = trImgCntr 
                                 
                                 img_path_c1_s1 = os.path.join(str(iCntr)+'_pred_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_fake_img_c1_s1[trImgCntr]+'.png')
+                                img_path_c1_s1_bin = os.path.join(str(iCntr)+'_predBin_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_fake_img_c1_s1_bin[trImgCntr]+'.png')
                                 img_path_gt_1 = os.path.join(str(iCntr)+'_gt_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_gt_1[trImgCntr]+'.png')
                                 img_path_gt_2 = os.path.join(str(iCntr)+'_gt_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr:'+preds_str_gt_2[trImgCntr]+'.png')
                                 img_path_c2_s1 = os.path.join(str(iCntr)+'_pred_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr:'+preds_str_fake_img_c2_s1[trImgCntr]+'.png')
+                                img_path_c2_s1_bin = os.path.join(str(iCntr)+'_predBin_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr:'+preds_str_fake_img_c2_s1_bin[trImgCntr]+'.png')
                                 
-                                ims.append([img_path_gt_1, img_path_c1_s1, img_path_gt_2, img_path_c2_s1])
+                                ims.append([img_path_gt_1, img_path_c1_s1, img_path_c1_s1_bin, img_path_gt_2, img_path_c2_s1, img_path_c2_s1_bin])
 
                                 content_c1_s1 = 'PSTYLE-1 '+'Text-1:' + labels_gt[trImgCntr]+' OCR:' + preds_str_fake_img_c1_s1[trImgCntr]
+                                content_c1_s1_bin = 'PSTYLE-1 '+'Text-1:' + labels_gt[trImgCntr]+' OCR:' + preds_str_fake_img_c1_s1_bin[trImgCntr]
                                 content_gt_1 = 'OSTYLE-1 '+'GT:' + labels_gt[trImgCntr]+' OCR:' + preds_str_gt_1[trImgCntr]
                                 content_gt_2 = 'OSTYLE-1 '+'GT:' + labels_z_c[trImgCntr]+' OCR:'+preds_str_gt_2[trImgCntr]
                                 content_c2_s1 = 'PSTYLE-1 '+'Text-2:' + labels_z_c[trImgCntr]+' OCR:'+preds_str_fake_img_c2_s1[trImgCntr]
+                                content_c2_s1_bin = 'PSTYLE-1 '+'Text-2:' + labels_z_c[trImgCntr]+' OCR:'+preds_str_fake_img_c2_s1_bin[trImgCntr]
                                 
-                                txts.append([content_gt_1, content_c1_s1, content_gt_2, content_c2_s1])
+                                txts.append([content_gt_1, content_c1_s1, content_c1_s1_bin, content_gt_2, content_c2_s1, content_c2_s1_bin])
                                 
                                 utils.save_image(fake_img_c1_s1[trImgCntr],os.path.join(pathPrefix,str(iCntr)+'_pred_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_fake_img_c1_s1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                                utils.save_image(fake_img_c1_s1_bin[trImgCntr],os.path.join(pathPrefix,str(iCntr)+'_predBin_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_fake_img_c1_s1_bin[trImgCntr]+'.png'),nrow=1,normalize=True,range=(0, 1))
                                 
                                 if not opt.zAlone:
                                     utils.save_image(image_input_tensors[trImgCntr],os.path.join(pathPrefix,str(iCntr)+'_gt_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_gt_1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
                                     utils.save_image(image_output_tensors[trImgCntr],os.path.join(pathPrefix,str(iCntr)+'_gt_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr:'+preds_str_gt_2[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
                                     utils.save_image(fake_img_c2_s1[trImgCntr],os.path.join(pathPrefix,str(iCntr)+'_pred_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr:'+preds_str_fake_img_c2_s1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                                    utils.save_image(fake_img_c2_s1_bin[trImgCntr],os.path.join(pathPrefix,str(iCntr)+'_pred_valBin_c2_s1_'+labels_z_c[trImgCntr]+'_ocr:'+preds_str_fake_img_c2_s1_bin[trImgCntr]+'.png'),nrow=1,normalize=True,range=(0, 1))
                                     
-                                
                             except:
                                 print('Warning while saving validation image')
                 
@@ -1342,8 +1394,8 @@ def train(opt):
                         
                         loss_log = f'[{iteration+1}/{opt.num_iter}]  \
                             Train Dis loss: {loss_avg_dis.val():0.5f}, Train Gen loss: {loss_avg_gen.val():0.5f},\
-                            Train Sup OCR loss: {loss_avg_ocr_sup.val():0.5f}, \
                             Train UnSup OCR loss: {loss_avg_ocr_unsup.val():0.5f}, \
+                            Train Mask OCR loss: {loss_avg_ocr_mask.val():0.5f}, \
                             Train Image Recon loss: {loss_avg_img_recon.val():0.5f}, \
                             Train Cycle Recon loss: {loss_avg_cycle_recon.val():0.5f}, \
                             Train VGG Per loss: {loss_avg_vgg_per.val():0.5f}, Train VGG Style loss: {loss_avg_vgg_sty.val():0.5f}, \
@@ -1360,8 +1412,8 @@ def train(opt):
                         #plotting
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Dis-Loss'), loss_avg_dis.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Gen-Loss'), loss_avg_gen.val().item())
-                        lib.plot.plot(os.path.join(opt.plotDir,'Train-Sup-OCR-Loss'), loss_avg_ocr_sup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-UnSup-OCR-Loss'), loss_avg_ocr_unsup.val().item())
+                        lib.plot.plot(os.path.join(opt.plotDir,'Train-Mask-OCR-Loss'), loss_avg_ocr_mask.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-ImageRecon-Loss'), loss_avg_img_recon.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-CycleRecon-Loss'), loss_avg_cycle_recon.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-VGGPer-Loss'), loss_avg_vgg_per.val().item())
@@ -1391,6 +1443,7 @@ def train(opt):
                         loss_avg_dis.reset()
                         loss_avg_gen.reset()
                         loss_avg_ocr_unsup.reset()
+                        loss_avg_ocr_mask.reset()
                         loss_avg_ocr_sup.reset()
                         loss_avg_style_ucode.reset()
                         loss_avg_style_scode.reset()
@@ -1540,6 +1593,7 @@ if __name__ == '__main__':
     parser.add_argument('--char_embed_size', type=int, default=60, help='character embedding for content encoder')
     parser.add_argument('--ocrFixed', action='store_true', help='true: for pretrined OCR and fixed weights')
     parser.add_argument('--ocrWeight', type=float, default=1.0, help='weights for loss')
+    parser.add_argument('--ocrMaskWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--reconWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--cycleReconWeight', type=float, default=1.0, help='weights for loss')
     parser.add_argument('--disWeight', type=float, default=1.0, help='weights for loss')

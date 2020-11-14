@@ -308,7 +308,7 @@ def train(opt):
         genModel = styleGANGen(opt.size, opt.style_latent, opt.latent, opt.n_mlp, content_dim=c_code_size, channel_multiplier=opt.channel_multiplier).to(device)
         g_ema = styleGANGen(opt.size, opt.style_latent, opt.latent, opt.n_mlp, content_dim=c_code_size, channel_multiplier=opt.channel_multiplier).to(device)
     g_ema.eval()
-    disEncModel = styleGANDis(opt.size, channel_multiplier=opt.channel_multiplier, input_dim=opt.input_channel, code_s_dim=opt.latent).to(device)
+    disEncModel = styleGANDis(opt.size, channel_multiplier=opt.channel_multiplier, input_dim=opt.input_channel+1, code_s_dim=opt.latent).to(device)
     
     accumulate(g_ema, genModel, 0)
     
@@ -372,7 +372,6 @@ def train(opt):
         if not opt.zAlone:
             cEncoder.load_state_dict(checkpoint['cEncoder'])
             styleModel.load_state_dict(checkpoint['styleModel'])
-            print('loading pretrained ocr model from synth checkpoint')
             ocrModel.load_state_dict(checkpoint['ocrModel'])
         genModel.load_state_dict(checkpoint['genModel'])
         g_ema.load_state_dict(checkpoint['g_ema'])
@@ -568,6 +567,7 @@ def train(opt):
             # gt_image_tensors = image_input_tensors.detach()    #exemplar word style image; training OCR
             # real_image_tensors = image_input_tensors.detach()  #discriminator
             synth_z_c = synth_z_c.to(device)
+            labelSynthImg = labelSynthImg.to(device)
 
             # labels_gt = labels[:opt.batch_size]
             
@@ -617,8 +617,8 @@ def train(opt):
             #Domain discriminator
             # print('Before disModel')
                
-            fake_pred = disEncModel(fake_img)
-            real_pred = disEncModel(image_input_tensors)
+            fake_pred = disEncModel(torch.cat((fake_img,synth_z_c),dim=1))
+            real_pred = disEncModel(torch.cat((image_input_tensors,labelSynthImg),dim=1))
             # print('After disModel')
             
             disCost = d_logistic_loss(real_pred, fake_pred)
@@ -644,7 +644,7 @@ def train(opt):
                 image_input_tensors.requires_grad = True
                 # print('before d_regularize backward')
                 
-                real_pred = disEncModel(image_input_tensors)
+                real_pred = disEncModel(torch.cat((image_input_tensors,labelSynthImg),dim=1))
                 
                 r1_loss = d_r1_loss(real_pred, image_input_tensors)
 
@@ -743,7 +743,7 @@ def train(opt):
             # print('after generator genModel')
             
 
-            fake_pred = disEncModel(fake_gt_img)
+            fake_pred = disEncModel(torch.cat((fake_gt_img,labelSynthImg),dim=1))
             disGenCost = g_nonsaturating_loss(fake_pred)
             # print('after generator disModel')
             
@@ -1342,7 +1342,6 @@ def train(opt):
                         
                         loss_log = f'[{iteration+1}/{opt.num_iter}]  \
                             Train Dis loss: {loss_avg_dis.val():0.5f}, Train Gen loss: {loss_avg_gen.val():0.5f},\
-                            Train Sup OCR loss: {loss_avg_ocr_sup.val():0.5f}, \
                             Train UnSup OCR loss: {loss_avg_ocr_unsup.val():0.5f}, \
                             Train Image Recon loss: {loss_avg_img_recon.val():0.5f}, \
                             Train Cycle Recon loss: {loss_avg_cycle_recon.val():0.5f}, \
@@ -1360,7 +1359,6 @@ def train(opt):
                         #plotting
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Dis-Loss'), loss_avg_dis.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Gen-Loss'), loss_avg_gen.val().item())
-                        lib.plot.plot(os.path.join(opt.plotDir,'Train-Sup-OCR-Loss'), loss_avg_ocr_sup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-UnSup-OCR-Loss'), loss_avg_ocr_unsup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-ImageRecon-Loss'), loss_avg_img_recon.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-CycleRecon-Loss'), loss_avg_cycle_recon.val().item())

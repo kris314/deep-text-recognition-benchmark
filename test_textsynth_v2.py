@@ -25,9 +25,13 @@ import pdb
 import html_visual as html
 from skimage.metrics import peak_signal_noise_ratio, mean_squared_error, structural_similarity
 from nltk.metrics.distance import edit_distance
+from skimage.transform import resize
+from skimage.io import imsave
+import skimage
+import cv2
 
 from utils import CTCLabelConverter, AttnLabelConverter, Averager
-from dataset import hierarchical_dataset, AlignPairCollate, AlignPairImgCollate, AlignSynthTextCollate, Batch_Balanced_Dataset, tensor2im, save_image, phoc_gen, text_gen, text_gen_synth, LmdbStyleDataset, LmdbTestStyleContentDataset
+from dataset import hierarchical_dataset, AlignPairCollate, AlignPairImgCollate, AlignPairImgCollate_Test, AlignSynthTextCollate, Batch_Balanced_Dataset, tensor2im, save_image, phoc_gen, text_gen, text_gen_synth, LmdbStyleDataset, LmdbTestStyleContentDataset
 from model import ModelV1, GlobalContentEncoder, VGGPerceptualEmbedLossModel, VGGFontModel
 from modules.feature_extraction import ResNet_StyleExtractor, VGG_ContentExtractor, ResNet_StyleExtractor_WIN
 
@@ -142,7 +146,8 @@ def test(opt):
         print('Filtering the images whose label is longer than opt.batch_max_length')
         # see https://github.com/clovaai/deep-text-recognition-benchmark/blob/6593928855fb7abb999a99f428b3e4477d4ae356/dataset.py#L130
 
-    AlignCollate_valid = AlignPairImgCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
+    # AlignCollate_valid = AlignPairImgCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
+    AlignCollate_valid = AlignPairImgCollate_Test(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
     
     valid_dataset = LmdbTestStyleContentDataset(root=opt.test_data, opt=opt, dataMode=opt.realVaData)
     test_data_sampler = data_sampler(valid_dataset, shuffle=False, distributed=False)
@@ -167,6 +172,7 @@ def test(opt):
         drop_last=True)
     opt.num_class = len(converter.character)
 
+ 
     text_loader = sample_data(text_loader, text_data_sampler, False)
 
     c_code_size = opt.latent
@@ -217,16 +223,17 @@ def test(opt):
     
     ims, txts = [], []
     
-    for vCntr, (image_input_tensors, image_output_tensors, labels_gt, labels_z_c, labelSynthImg, synth_z_c) in enumerate(valid_loader):
+    for vCntr, (image_input_tensors, image_output_tensors, labels_gt, labels_z_c, labelSynthImg, synth_z_c, input_1_shape, input_2_shape) in enumerate(valid_loader):
         print(vCntr)
 
-        if opt.debugFlag and vCntr >2:
+        if opt.debugFlag and vCntr >10:
             break  
         
         image_input_tensors = image_input_tensors.to(device)
         image_output_tensors = image_output_tensors.to(device)
 
-        if opt.realVaData:
+        if opt.realVaData and opt.outPairFile=="":
+            # pdb.set_trace()
             labels_z_c, synth_z_c = next(text_loader)
         
         labelSynthImg = labelSynthImg.to(device)
@@ -235,6 +242,8 @@ def test(opt):
         
         text_z_c, length_z_c = converter.encode(labels_z_c, batch_max_length=opt.batch_max_length)
         text_gt, length_gt = converter.encode(labels_gt, batch_max_length=opt.batch_max_length)
+        
+        # print(labels_z_c)
 
         cEncoder.eval()
         styleModel.eval()
@@ -319,16 +328,44 @@ def test(opt):
         
         for trImgCntr in range(image_output_tensors.shape[0]):
             
-            labelId = 'label-%09d' % valid_loader.dataset.filtered_index_list[fCntr]
+            if opt.outPairFile!="":
+                labelId = 'label-' + valid_loader.dataset.pairId[fCntr] + '-' + str(fCntr)
+            else:
+                labelId = 'label-%09d' % valid_loader.dataset.filtered_index_list[fCntr]
             #evaluations
             valRange = (-1,+1)
-            gtTensor = tensor2im(image_output_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1]))
-            predTensor = tensor2im(fake_img_c2_s1[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1]))
+            # pdb.set_trace()
+            # inpTensor = skimage.img_as_ubyte(resize(tensor2im(image_input_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0])))
+            # gtTensor = skimage.img_as_ubyte(resize(tensor2im(image_output_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0])))
+            # predTensor = skimage.img_as_ubyte(resize(tensor2im(fake_img_c2_s1[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0])))
             
+            # inpTensor = resize(tensor2im(image_input_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0]), anti_aliasing=True)
+            # gtTensor = resize(tensor2im(image_output_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0]), anti_aliasing=True)
+            # predTensor = resize(tensor2im(fake_img_c2_s1[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0]), anti_aliasing=True)
+
+            inpTensor = F.interpolate(image_input_tensors[trImgCntr].unsqueeze(0),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0]))
+            gtTensor = F.interpolate(image_output_tensors[trImgCntr].unsqueeze(0),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0]))
+            predTensor = F.interpolate(fake_img_c2_s1[trImgCntr].unsqueeze(0),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0]))
+            predGTTensor = F.interpolate(fake_img_c1_s1[trImgCntr].unsqueeze(0),(input_1_shape[trImgCntr][1], input_1_shape[trImgCntr][0]))
+
+            # inpTensor = cv2.resize(tensor2im(image_input_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),tuple(input_1_shape[trImgCntr]))
+            # gtTensor = cv2.resize(tensor2im(image_output_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),tuple(input_1_shape[trImgCntr]))
+            # predTensor = cv2.resize(tensor2im(fake_img_c2_s1[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),tuple(input_1_shape[trImgCntr]))
+            # predGTTensor = cv2.resize(tensor2im(fake_img_c1_s1[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),tuple(input_1_shape[trImgCntr]))
+
+            # inpTensor = cv2.medianBlur(cv2.resize(tensor2im(image_input_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),tuple(input_1_shape[trImgCntr])),5)
+            # gtTensor = cv2.medianBlur(cv2.resize(tensor2im(image_output_tensors[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),tuple(input_1_shape[trImgCntr])),5)
+            # predTensor = cv2.medianBlur(cv2.resize(tensor2im(fake_img_c2_s1[trImgCntr].clone().clamp_(min=valRange[0], max=valRange[1])),tuple(input_1_shape[trImgCntr])),5)
+            # pdb.set_trace()
+
             if not(opt.realVaData):
-                evalMSE = mean_squared_error(gtTensor/255, predTensor/255)
-                evalSSIM = structural_similarity(gtTensor, predTensor, multichannel=True)
-                evalPSNR = peak_signal_noise_ratio(gtTensor, predTensor)
+                evalMSE = mean_squared_error(tensor2im(gtTensor.squeeze())/255, tensor2im(predTensor.squeeze())/255)
+                # evalMSE = mean_squared_error(gtTensor/255, predTensor/255)
+                evalSSIM = structural_similarity(tensor2im(gtTensor.squeeze())/255, tensor2im(predTensor.squeeze())/255, multichannel=True)
+                # evalSSIM = structural_similarity(gtTensor/255, predTensor/255, multichannel=True)
+                evalPSNR = peak_signal_noise_ratio(tensor2im(gtTensor.squeeze())/255, tensor2im(predTensor.squeeze())/255)
+                # evalPSNR = peak_signal_noise_ratio(gtTensor/255, predTensor/255)
+                # print(evalMSE,evalSSIM,evalPSNR)
 
                 valMSE+=evalMSE
                 valSSIM+=evalSSIM
@@ -388,12 +425,22 @@ def test(opt):
                     
                     txts.append([content_gt_1, content_c1_s1, content_gt_2, content_c2_s1])
                     
-                    utils.save_image(fake_img_c1_s1[trImgCntr],os.path.join(pathPrefix,labelId+'_pred_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr_'+preds_str_fake_img_c1_s1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                    utils.save_image(predGTTensor,os.path.join(pathPrefix,labelId+'_pred_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr_'+preds_str_fake_img_c1_s1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                    # cv2.imwrite(os.path.join(pathPrefix,labelId+'_pred_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr_'+preds_str_fake_img_c1_s1[trImgCntr]+'.png'), predGTTensor)
                     
+                    # pdb.set_trace()
                     if not opt.zAlone:
-                        utils.save_image(image_input_tensors[trImgCntr],os.path.join(pathPrefix,labelId+'_gt_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr_'+preds_str_gt_1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
-                        utils.save_image(image_output_tensors[trImgCntr],os.path.join(pathPrefix,labelId+'_gt_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr_'+preds_str_gt_2[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
-                        utils.save_image(fake_img_c2_s1[trImgCntr],os.path.join(pathPrefix,labelId+'_pred_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr_'+preds_str_fake_img_c2_s1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1)) 
+                        utils.save_image(inpTensor,os.path.join(pathPrefix,labelId+'_gt_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr_'+preds_str_gt_1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                        utils.save_image(gtTensor,os.path.join(pathPrefix,labelId+'_gt_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr_'+preds_str_gt_2[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
+                        utils.save_image(predTensor,os.path.join(pathPrefix,labelId+'_pred_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr_'+preds_str_fake_img_c2_s1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1)) 
+                        
+                        # imsave(os.path.join(pathPrefix,labelId+'_gt_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr_'+preds_str_gt_1[trImgCntr]+'.png'), inpTensor)
+                        # imsave(os.path.join(pathPrefix,labelId+'_gt_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr_'+preds_str_gt_2[trImgCntr]+'.png'), gtTensor)
+                        # imsave(os.path.join(pathPrefix,labelId+'_pred_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr_'+preds_str_fake_img_c2_s1[trImgCntr]+'.png'), predTensor) 
+
+                        # cv2.imwrite(os.path.join(pathPrefix,labelId+'_gt_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr_'+preds_str_gt_1[trImgCntr]+'.png'), inpTensor)
+                        # cv2.imwrite(os.path.join(pathPrefix,labelId+'_gt_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr_'+preds_str_gt_2[trImgCntr]+'.png'), gtTensor)
+                        # cv2.imwrite(os.path.join(pathPrefix,labelId+'_pred_val_c2_s1_'+labels_z_c[trImgCntr]+'_ocr_'+preds_str_fake_img_c2_s1[trImgCntr]+'.png'), predTensor) 
                 except:
                     print('Warning while saving validation image')
             
@@ -410,13 +457,18 @@ def test(opt):
     avg_c1_s1_input_cer = c1_s1_input_ed_correct/float(evalCntr)
     avg_c2_s1_gen_cer = c2_s1_gen_ed_correct/float(evalCntr)
 
-    if not(opt.realVaData):
-        with open(os.path.join(opt.exp_dir,opt.exp_name,'log_test.txt'), 'a') as log:
-            # training loss and validation loss
+    # if not(opt.realVaData):
+    with open(os.path.join(opt.exp_dir,opt.exp_name,'log_test.txt'), 'a') as log:
+        # training loss and validation loss
+        if opt.realVaData:
+            loss_log = f'Test Input Word Acc: {avg_c1_s1_input_wer:0.5f}, Test Gen Word Acc: {avg_c2_s1_gen_wer:0.5f}, Test Input Char Acc: {avg_c1_s1_input_cer:0.5f}, Test Gen Char Acc: {avg_c2_s1_gen_cer:0.5f}'
+        else:
             loss_log = f'Test MSE: {avg_valMSE:0.5f}, Test SSIM: {avg_valSSIM:0.5f}, Test PSNR: {avg_valPSNR:0.5f}, Test Input Word Acc: {avg_c1_s1_input_wer:0.5f}, Test Gen Word Acc: {avg_c2_s1_gen_wer:0.5f}, Test Input Char Acc: {avg_c1_s1_input_cer:0.5f}, Test Gen Char Acc: {avg_c2_s1_gen_cer:0.5f}'
-            
-            print(loss_log)
-            log.write(loss_log+"\n")
+        
+        print(loss_log)
+        log.write(loss_log+"\n")
+    
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -497,6 +549,9 @@ if __name__ == '__main__':
     parser.add_argument("--numLatents", type=int, default=1)
     parser.add_argument("--realTrData", action="store_true", help="flag for training real data where we don't have target style GT")
     parser.add_argument("--realVaData", action="store_true", help="flag for validation/testing real data where we don't have target style GT")
+
+    
+    parser.add_argument('--outPairFile', default="", help='unqiue words in language')
 
     opt = parser.parse_args()
 

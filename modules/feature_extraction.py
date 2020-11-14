@@ -1,5 +1,8 @@
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
+import torch
+from collections import OrderedDict
 
 import pdb
 
@@ -91,6 +94,17 @@ class ResNet_StyleExtractor_WBN(nn.Module):
     def __init__(self, input_channel, output_channel=512):
         super(ResNet_StyleExtractor_WBN, self).__init__()
         self.ConvNet = ResNet_Style_WBN(input_channel, output_channel, BasicBlock_WBN, [1, 2, 5, 3])
+
+    def forward(self, input):
+        return self.ConvNet(input)
+
+
+class ResNet_StyleExtractor_FPN(nn.Module):
+    """ FeatureExtractor of FAN (http://openaccess.thecvf.com/content_ICCV_2017/papers/Cheng_Focusing_Attention_Towards_ICCV_2017_paper.pdf) """
+
+    def __init__(self, input_channel, output_channel=512, fpn_out_channels=512):
+        super(ResNet_StyleExtractor_FPN, self).__init__()
+        self.ConvNet = ResNet_Style_FPN(input_channel, output_channel, fpn_out_channels, BasicBlock_WBN, [1, 2, 5, 3])
 
     def forward(self, input):
         return self.ConvNet(input)
@@ -753,6 +767,150 @@ class ResNet_Style_WBN(nn.Module):
         # x = self.relu(x)
         x = F.adaptive_avg_pool2d(x,1).squeeze(2).squeeze(2)
 
+        return x
+
+class ResNet_Style_FPN(nn.Module):
+
+    def __init__(self, input_channel, output_channel, fpn_out_channels, block, layers):
+        super(ResNet_Style_FPN, self).__init__()
+
+        self.fpn_out_channels = fpn_out_channels
+
+        self.output_channel_block = [int(output_channel / 4), int(output_channel / 2), output_channel, output_channel]
+
+        self.inplanes = int(output_channel / 8)
+        self.conv0_1 = nn.Conv2d(input_channel, int(output_channel / 16),
+                                 kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn0_1 = nn.BatchNorm2d(int(output_channel / 16))
+        self.conv0_2 = nn.Conv2d(int(output_channel / 16), self.inplanes,
+                                 kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn0_2 = nn.BatchNorm2d(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.maxpool1 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        self.layer1 = self._make_layer(block, self.output_channel_block[0], layers[0])
+        self.conv1 = nn.Conv2d(self.output_channel_block[0], self.output_channel_block[
+                               0], kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.output_channel_block[0])
+
+        self.maxpool2 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        self.layer2 = self._make_layer(block, self.output_channel_block[1], layers[1], stride=1)
+        self.conv2 = nn.Conv2d(self.output_channel_block[1], self.output_channel_block[
+                               1], kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(self.output_channel_block[1])
+
+        self.maxpool3 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        self.layer3 = self._make_layer(block, self.output_channel_block[2], layers[2], stride=1)
+        self.conv3 = nn.Conv2d(self.output_channel_block[2], self.output_channel_block[
+                               2], kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(self.output_channel_block[2])
+
+        self.maxpool4 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        self.layer4 = self._make_layer(block, self.output_channel_block[3], layers[3], stride=1)
+        self.conv4_1 = nn.Conv2d(self.output_channel_block[3], self.output_channel_block[
+                                 3], kernel_size=2, stride=2, padding=0, bias=False)
+        self.bn4_1 = nn.BatchNorm2d(self.output_channel_block[3])
+        # self.conv4_2 = nn.Conv2d(self.output_channel_block[3], self.output_channel_block[
+        #                          3], kernel_size=2, stride=2, padding=0, bias=False)
+        # self.bn4_2 = nn.BatchNorm2d(self.output_channel_block[3])
+
+        self.fpn_ops = torchvision.ops.FeaturePyramidNetwork([int(output_channel / 8), self.output_channel_block[0], self.output_channel_block[1], self.output_channel_block[2], self.output_channel_block[3], self.output_channel_block[3]], fpn_out_channels)
+
+        self.style_layer_1 = self._make_style_layer(1,fpn_out_channels)
+        self.style_layer_2 = self._make_style_layer(2,fpn_out_channels)
+        self.style_layer_3 = self._make_style_layer(3,fpn_out_channels)
+        self.style_layer_4 = self._make_style_layer(4,fpn_out_channels)
+        self.style_layer_5 = self._make_style_layer(5,fpn_out_channels)
+
+    def _make_style_layer(self, num_layers, out_channels):
+
+        layers=[]
+
+        for i in range(num_layers):
+            layers.append(nn.Sequential(
+                nn.Conv2d(out_channels, out_channels,
+                          kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+                )
+            )
+        layers.append(nn.AdaptiveAvgPool2d(1))
+        
+        return nn.Sequential(*layers)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x_fpn = OrderedDict()
+
+        x = self.conv0_1(x)
+        x = self.bn0_1(x)
+        x = self.relu(x)
+        x = self.conv0_2(x)
+        x = self.bn0_2(x)
+        x = self.relu(x)
+        x_fpn['feat1'] = x  #64x256
+
+        x = self.maxpool1(x)
+        x = self.layer1(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x_fpn['feat2'] = x  #32x128
+
+        x = self.maxpool2(x)
+        x = self.layer2(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x_fpn['feat3'] = x  #16x64
+
+        x = self.maxpool3(x)
+        x = self.layer3(x)
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        x_fpn['feat4'] = x  #8x32
+
+        x = self.maxpool4(x)
+        x = self.layer4(x)
+        x = self.conv4_1(x)
+        x = self.bn4_1(x)
+        x = self.relu(x)
+        x_fpn['feat5'] = x  #4x16
+        
+        # x = self.conv4_2(x)
+        # x = self.bn4_2(x)
+        # x = self.relu(x)
+        # x_fpn['feat4'] = x  #2x8
+
+        # x = F.adaptive_avg_pool2d(x,1).squeeze(2).squeeze(2)
+        
+        out_fpn = self.fpn_ops(x_fpn)
+
+        latent_4 = self.style_layer_1(out_fpn['feat5']).view(-1,1,self.fpn_out_channels)
+        latent_8 = self.style_layer_2(out_fpn['feat4']).view(-1,1,self.fpn_out_channels)
+        latent_16 = self.style_layer_3(out_fpn['feat3']).view(-1,1,self.fpn_out_channels)
+        latent_32 = self.style_layer_4(out_fpn['feat2']).view(-1,1,self.fpn_out_channels)
+        latent_64 = self.style_layer_5(out_fpn['feat1']).view(-1,1,self.fpn_out_channels)
+
+        x = torch.cat((latent_4,latent_8,latent_16,latent_32,latent_64), dim=1)
+        
         return x
 
 class VGG_ContentExtractor(nn.Module):

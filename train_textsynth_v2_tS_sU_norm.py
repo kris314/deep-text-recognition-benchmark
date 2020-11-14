@@ -27,7 +27,7 @@ from skimage.metrics import peak_signal_noise_ratio, mean_squared_error, structu
 from nltk.metrics.distance import edit_distance
 
 from utils import CTCLabelConverter, AttnLabelConverter, Averager
-from dataset import hierarchical_dataset, AlignPairCollate, AlignPairImgCollate, AlignSynthTextCollate, Batch_Balanced_Dataset, tensor2im, save_image, phoc_gen, text_gen, text_gen_synth, LmdbStyleDataset, LmdbStyleContentDataset
+from dataset import hierarchical_dataset, AlignPairCollate, AlignPairImgCollate_Norm, AlignSynthTextCollate, Batch_Balanced_Dataset, tensor2im, save_image, phoc_gen, text_gen, text_gen_synth, LmdbStyleDataset, LmdbStyleContentDataset
 # from model import ModelV1, StyleTensorEncoder, StyleLatentEncoder, MsImageDisV2, AdaIN_Tensor_WordGenerator, VGGPerceptualLossModel, Mixer
 from model import ModelV1, GlobalContentEncoder, VGGPerceptualEmbedLossModel, VGGFontModel
 # from test_synth import validation_synth_v7
@@ -188,7 +188,7 @@ def train(opt):
         # see https://github.com/clovaai/deep-text-recognition-benchmark/blob/6593928855fb7abb999a99f428b3e4477d4ae356/dataset.py#L130
 
     log = open(os.path.join(opt.exp_dir,opt.exp_name,'log_dataset.txt'), 'a')
-    AlignCollate_valid = AlignPairImgCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
+    AlignCollate_valid = AlignPairImgCollate_Norm(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
 
     # train_dataset = LmdbStyleDataset(root=opt.train_data, opt=opt)
     
@@ -372,7 +372,6 @@ def train(opt):
         if not opt.zAlone:
             cEncoder.load_state_dict(checkpoint['cEncoder'])
             styleModel.load_state_dict(checkpoint['styleModel'])
-            print('loading pretrained ocr model from synth checkpoint')
             ocrModel.load_state_dict(checkpoint['ocrModel'])
         genModel.load_state_dict(checkpoint['genModel'])
         g_ema.load_state_dict(checkpoint['g_ema'])
@@ -1342,7 +1341,6 @@ def train(opt):
                         
                         loss_log = f'[{iteration+1}/{opt.num_iter}]  \
                             Train Dis loss: {loss_avg_dis.val():0.5f}, Train Gen loss: {loss_avg_gen.val():0.5f},\
-                            Train Sup OCR loss: {loss_avg_ocr_sup.val():0.5f}, \
                             Train UnSup OCR loss: {loss_avg_ocr_unsup.val():0.5f}, \
                             Train Image Recon loss: {loss_avg_img_recon.val():0.5f}, \
                             Train Cycle Recon loss: {loss_avg_cycle_recon.val():0.5f}, \
@@ -1360,7 +1358,6 @@ def train(opt):
                         #plotting
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Dis-Loss'), loss_avg_dis.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Gen-Loss'), loss_avg_gen.val().item())
-                        lib.plot.plot(os.path.join(opt.plotDir,'Train-Sup-OCR-Loss'), loss_avg_ocr_sup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-UnSup-OCR-Loss'), loss_avg_ocr_unsup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-ImageRecon-Loss'), loss_avg_img_recon.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-CycleRecon-Loss'), loss_avg_cycle_recon.val().item())

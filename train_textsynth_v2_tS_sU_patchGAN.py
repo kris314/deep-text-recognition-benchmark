@@ -45,7 +45,7 @@ except ImportError:
     wandb = None
 
 from model_word import GeneratorM2V4_5 as styleGANGen 
-from model_word import EncDiscriminator as styleGANDis  
+from model_word import EncDiscriminator_Patch as styleGANDis  
 from non_leaking import augment
 from distributed import (
     get_rank,
@@ -97,6 +97,15 @@ def d_logistic_loss(real_pred, fake_pred):
 
     return real_loss.mean() + fake_loss.mean()
 
+def d_logistic_loss_patch(real_pred_whole, real_pred_patch, fake_pred_whole, fake_pred_patch):
+    real_loss_whole = F.softplus(-real_pred_whole)
+    fake_loss_whole = F.softplus(fake_pred_whole)
+
+    real_loss_patch = F.softplus(-real_pred_patch)
+    fake_loss_patch = F.softplus(fake_pred_patch)
+
+    return real_loss_whole.mean() + fake_loss_whole.mean() + real_loss_patch.mean() + fake_loss_patch.mean()
+
 
 def d_r1_loss(real_pred, real_img):
     grad_real, = autograd.grad(
@@ -106,9 +115,22 @@ def d_r1_loss(real_pred, real_img):
 
     return grad_penalty
 
+def d_r1_loss_patch(real_pred_whole, real_pred_patch, real_img):
+    grad_real, = autograd.grad(
+        outputs=real_pred_whole.sum()+real_pred_patch.sum(), inputs=real_img, create_graph=True
+    )
+    grad_penalty = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
+
+    return grad_penalty
+
 
 def g_nonsaturating_loss(fake_pred):
     loss = F.softplus(-fake_pred).mean()
+
+    return loss
+
+def g_nonsaturating_loss_patch(fake_pred_whole, fake_pred_patch):
+    loss = F.softplus(-fake_pred_whole).mean() + F.softplus(-fake_pred_patch).mean()
 
     return loss
 
@@ -372,7 +394,6 @@ def train(opt):
         if not opt.zAlone:
             cEncoder.load_state_dict(checkpoint['cEncoder'])
             styleModel.load_state_dict(checkpoint['styleModel'])
-            print('loading pretrained ocr model from synth checkpoint')
             ocrModel.load_state_dict(checkpoint['ocrModel'])
         genModel.load_state_dict(checkpoint['genModel'])
         g_ema.load_state_dict(checkpoint['g_ema'])
@@ -617,11 +638,11 @@ def train(opt):
             #Domain discriminator
             # print('Before disModel')
                
-            fake_pred = disEncModel(fake_img)
-            real_pred = disEncModel(image_input_tensors)
+            fake_pred_patch, fake_pred_whole = disEncModel(fake_img)
+            real_pred_patch, real_pred_whole = disEncModel(image_input_tensors)
             # print('After disModel')
             
-            disCost = d_logistic_loss(real_pred, fake_pred)
+            disCost = d_logistic_loss_patch(real_pred_whole, real_pred_patch, fake_pred_whole, fake_pred_patch)
 
             dis_t_cost = disCost + opt.gamma_e*uCost
             loss_avg_dis.add(disCost)
@@ -644,12 +665,12 @@ def train(opt):
                 image_input_tensors.requires_grad = True
                 # print('before d_regularize backward')
                 
-                real_pred = disEncModel(image_input_tensors)
+                real_pred_patch, real_pred_whole = disEncModel(image_input_tensors)
                 
-                r1_loss = d_r1_loss(real_pred, image_input_tensors)
+                r1_loss = d_r1_loss_patch(real_pred_whole, real_pred_patch, image_input_tensors)
 
                 disEncModel.zero_grad()
-                (opt.r1 / 2 * r1_loss * opt.d_reg_every + 0 * real_pred[0]).backward()
+                (opt.r1 / 2 * r1_loss * opt.d_reg_every + 0 * real_pred_whole[0]).backward()
                 # print('after d_regularize backward')
                 
                 if opt.grad_clip !=0.0:
@@ -743,8 +764,8 @@ def train(opt):
             # print('after generator genModel')
             
 
-            fake_pred = disEncModel(fake_gt_img)
-            disGenCost = g_nonsaturating_loss(fake_pred)
+            fake_pred_patch, fake_pred_whole  = disEncModel(fake_gt_img)
+            disGenCost = g_nonsaturating_loss_patch(fake_pred_whole, fake_pred_patch)
             # print('after generator disModel')
             
 
@@ -1342,7 +1363,6 @@ def train(opt):
                         
                         loss_log = f'[{iteration+1}/{opt.num_iter}]  \
                             Train Dis loss: {loss_avg_dis.val():0.5f}, Train Gen loss: {loss_avg_gen.val():0.5f},\
-                            Train Sup OCR loss: {loss_avg_ocr_sup.val():0.5f}, \
                             Train UnSup OCR loss: {loss_avg_ocr_unsup.val():0.5f}, \
                             Train Image Recon loss: {loss_avg_img_recon.val():0.5f}, \
                             Train Cycle Recon loss: {loss_avg_cycle_recon.val():0.5f}, \
@@ -1360,7 +1380,6 @@ def train(opt):
                         #plotting
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Dis-Loss'), loss_avg_dis.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Gen-Loss'), loss_avg_gen.val().item())
-                        lib.plot.plot(os.path.join(opt.plotDir,'Train-Sup-OCR-Loss'), loss_avg_ocr_sup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-UnSup-OCR-Loss'), loss_avg_ocr_unsup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-ImageRecon-Loss'), loss_avg_img_recon.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-CycleRecon-Loss'), loss_avg_cycle_recon.val().item())

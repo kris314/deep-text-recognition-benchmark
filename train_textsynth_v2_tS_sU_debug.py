@@ -44,7 +44,7 @@ try:
 except ImportError:
     wandb = None
 
-from model_word import GeneratorM2V4_5 as styleGANGen 
+from model_word import GeneratorM2V4_5_debug as styleGANGen 
 from model_word import EncDiscriminator as styleGANDis  
 from non_leaking import augment
 from distributed import (
@@ -372,7 +372,6 @@ def train(opt):
         if not opt.zAlone:
             cEncoder.load_state_dict(checkpoint['cEncoder'])
             styleModel.load_state_dict(checkpoint['styleModel'])
-            print('loading pretrained ocr model from synth checkpoint')
             ocrModel.load_state_dict(checkpoint['ocrModel'])
         genModel.load_state_dict(checkpoint['genModel'])
         g_ema.load_state_dict(checkpoint['g_ema'])
@@ -1088,12 +1087,12 @@ def train(opt):
                             style = [style]
                             # style_2 = [style_2]
                         # print('inside valoidatoin before genModel c1 s1')
-                        
-                        fake_img_c1_s1, _ = g_ema(style, z_gt_code, input_is_latent=opt.input_latent)
+                        pdb.set_trace()
+                        fake_img_c1_s1, _, skip_images_c1 = g_ema(style, z_gt_code, input_is_latent=opt.input_latent)
                         # print('inside valoidatoin after genModel c1 s1')
                         
                         if not opt.zAlone:
-                            fake_img_c2_s1, _ = g_ema(style, z_c_code, input_is_latent=opt.input_latent)
+                            fake_img_c2_s1, _, skip_images_c2 = g_ema(style, z_c_code, input_is_latent=opt.input_latent)
                             if not(opt.realVaData):
                                 loss_recon_val.add(reconCriterion(fake_img_c2_s1, image_output_tensors)) 
                             else:
@@ -1274,6 +1273,7 @@ def train(opt):
                                 
                                 txts.append([content_gt_1, content_c1_s1, content_gt_2, content_c2_s1])
                                 
+                                pdb.set_trace()
                                 utils.save_image(fake_img_c1_s1[trImgCntr],os.path.join(pathPrefix,str(iCntr)+'_pred_val_c1_s1_'+labels_gt[trImgCntr]+'_ocr:'+preds_str_fake_img_c1_s1[trImgCntr]+'.png'),nrow=1,normalize=True,range=(-1, 1))
                                 
                                 if not opt.zAlone:
@@ -1342,7 +1342,6 @@ def train(opt):
                         
                         loss_log = f'[{iteration+1}/{opt.num_iter}]  \
                             Train Dis loss: {loss_avg_dis.val():0.5f}, Train Gen loss: {loss_avg_gen.val():0.5f},\
-                            Train Sup OCR loss: {loss_avg_ocr_sup.val():0.5f}, \
                             Train UnSup OCR loss: {loss_avg_ocr_unsup.val():0.5f}, \
                             Train Image Recon loss: {loss_avg_img_recon.val():0.5f}, \
                             Train Cycle Recon loss: {loss_avg_cycle_recon.val():0.5f}, \
@@ -1360,7 +1359,6 @@ def train(opt):
                         #plotting
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Dis-Loss'), loss_avg_dis.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-Gen-Loss'), loss_avg_gen.val().item())
-                        lib.plot.plot(os.path.join(opt.plotDir,'Train-Sup-OCR-Loss'), loss_avg_ocr_sup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-UnSup-OCR-Loss'), loss_avg_ocr_unsup.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-ImageRecon-Loss'), loss_avg_img_recon.val().item())
                         lib.plot.plot(os.path.join(opt.plotDir,'Train-CycleRecon-Loss'), loss_avg_cycle_recon.val().item())

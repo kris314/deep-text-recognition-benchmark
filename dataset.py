@@ -103,7 +103,7 @@ class Batch_Balanced_Dataset(object):
 
         for i, data_loader_iter in enumerate(self.dataloader_iter_list):
             try:
-                pdb.set_trace()
+                
                 image, text = data_loader_iter.next()
                 
                 balanced_batch_images.append(image)
@@ -640,6 +640,18 @@ class LmdbTestStyleContentDataset(Dataset):
             print('cannot create lmdb from %s' % (root))
             sys.exit(0)
 
+        self.pairId = []
+        self.pairText = []
+        if opt.outPairFile!="":
+            with open(opt.outPairFile,'r') as pID:
+                lines = pID.readlines()
+
+                for currline in lines:
+                    tokens = currline[:-1].split(" ")
+                    labelTok = tokens[0].split('-')
+                    self.pairId.append(labelTok[1])
+                    self.pairText.append(tokens[2])
+
         with self.env.begin(write=False) as txn:
             
             nSamples = int(txn.get('num-samples'.encode()))
@@ -691,7 +703,7 @@ class LmdbTestStyleContentDataset(Dataset):
                             else:
                                 img1 = Image.open(buf1).convert('L')
                             
-                            if opt.sizeFilt and (img1.size[1]<opt.imgH_filt or (img1.size[0] < 1.5*img1.size[1])):
+                            if opt.sizeFilt and (img1.size[1]<opt.imgH_filt or (img1.size[0] < 1.25*img1.size[1])):
                                 continue
                         except IOError:
                             print(f'Corrupted image for {index}')
@@ -714,35 +726,65 @@ class LmdbTestStyleContentDataset(Dataset):
                     self.filtered_index_list.append(index)
 
                 self.nSamples = len(self.filtered_index_list)
-                print('Filtered nSamples:::::::::::::',self.nSamples)
+                if len(self.pairId)>0:
+                    print('Filtered nSamples:::::::::::::',len(self.pairId))
+                else:
+                    print('Filtered nSamples:::::::::::::',self.nSamples)
                 self.realData = dataMode
 
     def __len__(self):
-        return self.nSamples
+        if len(self.pairId)>0:
+            return len(self.pairId)
+        else:
+            return self.nSamples
 
     def __getitem__(self, index):
         assert index <= len(self), 'index range error'
-        index = self.filtered_index_list[index]
+
+        if len(self.pairId)==0:
+            index = self.filtered_index_list[index]
 
         with self.env.begin(write=False) as txn:
-            if self.realData:
-                #todo: remove duplication; simplify
-                label1_key = 'label-%09d'.encode() % index
-                label2_key = 'label-%09d'.encode() % index
-            else:
-                label1_key = 'label1-%09d'.encode() % index
-                label2_key = 'label2-%09d'.encode() % index
             
-            label1 = txn.get(label1_key).decode('utf-8')
-            label2 = txn.get(label2_key).decode('utf-8')
-            
-            if self.realData:
-                #todo: remove duplication; simplify
-                img1_key = 'image-%09d'.encode() % index
-                img2_key = 'image-%09d'.encode() % index
+            if len(self.pairId)>0:
+                if self.realData:
+                    label1_key = ('label-'+self.pairId[index]).encode()
+                    label2_key = ('label-'+self.pairId[index]).encode()
+                else:
+                    label1_key = ('label1-'+self.pairId[index]).encode()
+                    label2_key = ('label2-'+self.pairId[index]).encode()
             else:
-                img1_key = 'image1-%09d'.encode() % index
-                img2_key = 'image2-%09d'.encode() % index
+                if self.realData:
+                    #todo: remove duplication; simplify
+                    label1_key = 'label-%09d'.encode() % index
+                    label2_key = 'label-%09d'.encode() % index
+                else:
+                    label1_key = 'label1-%09d'.encode() % index
+                    label2_key = 'label2-%09d'.encode() % index
+            
+            if len(self.pairId)>0:
+                label1 = txn.get(label1_key).decode('utf-8')
+                label2 = self.pairText[index]
+            else:
+                label1 = txn.get(label1_key).decode('utf-8')
+                label2 = txn.get(label2_key).decode('utf-8')
+
+            if len(self.pairId)>0:
+                if self.realData:
+                    #todo: remove duplication; simplify
+                    img1_key = ('image-'+self.pairId[index]).encode()
+                    img2_key = ('image-'+self.pairId[index]).encode()
+                else:
+                    img1_key = ('image1-'+self.pairId[index]).encode()
+                    img2_key = ('image2-'+self.pairId[index]).encode()
+            else:
+                if self.realData:
+                    #todo: remove duplication; simplify
+                    img1_key = 'image-%09d'.encode() % index
+                    img2_key = 'image-%09d'.encode() % index
+                else:
+                    img1_key = 'image1-%09d'.encode() % index
+                    img2_key = 'image2-%09d'.encode() % index
 
             img1buf = txn.get(img1_key)
             img2buf = txn.get(img2_key)
@@ -840,6 +882,39 @@ class ResizeNormalize(object):
         img.sub_(0.5).div_(0.5)
         return img
 
+class ResizeNormalize_translate(object):
+
+    def __init__(self, size, interpolation=Image.BICUBIC):
+        self.size = size
+        self.interpolation = interpolation
+        self.toTensor = transforms.ToTensor()
+        self.randomcrop=transforms.RandomResizedCrop((size[1],size[0]), scale=(0.99, 1.0), ratio=(1.0, 1.0), interpolation=interpolation)
+        self.affine = transforms.RandomAffine(0, translate=(0.1,0.2), scale=(0.8,1.0))
+
+    def __call__(self, img):
+        # img = img.resize(self.size, self.interpolation)
+        # img = self.affine(img)
+        img = self.randomcrop(img)
+        img = self.toTensor(img)
+        img.sub_(0.5).div_(0.5)
+        return img
+
+class ResizeNormalize_Mean(object):
+
+    def __init__(self, size, interpolation=Image.BICUBIC):
+        self.size = size
+        self.interpolation = interpolation
+        self.toTensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+
+    def __call__(self, img):
+        img = img.resize(self.size, self.interpolation)
+        img = self.toTensor(img)
+        img = self.normalize(img)
+        # img.sub_(0.5).div_(0.5)
+        return img
+
 
 class NormalizePAD(object):
 
@@ -852,6 +927,31 @@ class NormalizePAD(object):
     def __call__(self, img):
         img = self.toTensor(img)
         img.sub_(0.5).div_(0.5)
+        c, h, w = img.size()
+        Pad_img = torch.FloatTensor(*self.max_size).fill_(0)
+        Pad_img[:, :, :w] = img  # right pad
+        
+        if self.max_size[2] != w:  # add border Pad
+            # Pad_img[:, :, w:] = img[:, :, w - 1].unsqueeze(2).expand(c, h, self.max_size[2] - w)
+            zero_vec = torch.zeros((img.size()[0],img.size()[1]))
+            Pad_img[:, :, w:] = zero_vec.unsqueeze(2).expand(c, h, self.max_size[2] - w)
+        return Pad_img
+
+class NormalizePAD_Mean(object):
+
+    def __init__(self, max_size, PAD_type='right'):
+        self.toTensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        self.max_size = max_size
+        self.max_width_half = math.floor(max_size[2] / 2)
+        self.PAD_type = PAD_type
+
+    def __call__(self, img):
+        img = self.toTensor(img)
+        # img.sub_(0.5).div_(0.5)
+        img = self.normalize(img)
+
         c, h, w = img.size()
         Pad_img = torch.FloatTensor(*self.max_size).fill_(0)
         Pad_img[:, :, :w] = img  # right pad
@@ -1133,6 +1233,169 @@ class AlignPairImgCollate(object):
         # print(label1SynthImg_tensors.shape)
         return image_tensors1, image_tensors2, labels1, labels2, label1SynthImg_tensors, label2SynthImg_tensors
 
+
+class AlignPairImgCollate_dataaug(object):
+
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False, aug=False):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.aug = aug
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+
+    def __call__(self, batch):
+        batch = filter(lambda x: x is not None, batch)
+        images1, images2, labels1, labels2, label1SynthImgs, label2SynthImgs = zip(*batch)
+
+        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+            resized_max_w = self.imgW
+            input_channel = 3 if images1[0].mode == 'RGB' else 1
+            transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
+
+            input_channel_synth = 3 if label1SynthImgs[0].mode == 'RGB' else 1
+            transform_synth = NormalizePAD((input_channel_synth, self.imgH, resized_max_w))
+
+            resized_images1 = []
+            resized_images2 = []
+            resized_label1SynthImgs = []
+            resized_label2SynthImgs = []
+            
+            cntr=0
+            for image1 in images1:
+                image2=images2[cntr]
+                label1SynthImg=label1SynthImgs[cntr]
+                label2SynthImg=label2SynthImgs[cntr]
+                
+
+                w, h = image1.size
+                ratio = w / float(h)
+                if math.ceil(self.imgH * ratio) > self.imgW:
+                    resized_w = self.imgW
+                else:
+                    resized_w = math.ceil(self.imgH * ratio)
+
+                resized_image1 = image1.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images1.append(transform(resized_image1))
+                
+                #resizing image2 w.r.t image1 dimensions
+                resized_image2 = image2.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images2.append(transform(resized_image2))
+
+                resized_label1SynthImg = label1SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label1SynthImgs.append(transform_synth(resized_label1SynthImg))
+
+                resized_label2SynthImg = label2SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label2SynthImgs.append(transform_synth(resized_label2SynthImg))
+                # resized_image.save('./image_test/%d_test.jpg' % w)
+                cntr+=1
+
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in resized_images1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in resized_images2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label1SynthImgs], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label2SynthImgs], 0)
+
+        else:
+            transform_source = ResizeNormalize_translate((self.imgW, self.imgH))
+            transform = ResizeNormalize((self.imgW, self.imgH))
+            if self.aug:
+                image_tensors1 = [transform_source(image) for image in images1]
+                image_tensors2 = [transform(image) for image in images2]
+                
+                label1SynthImg_tensors = [transform(image) for image in label1SynthImgs]
+                label2SynthImg_tensors = [transform(image) for image in label2SynthImgs]
+            else:
+                image_tensors1 = [transform(image) for image in images1]
+                image_tensors2 = [transform(image) for image in images2]
+                
+                label1SynthImg_tensors = [transform(image) for image in label1SynthImgs]
+                label2SynthImg_tensors = [transform(image) for image in label2SynthImgs]
+            
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in image_tensors1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in image_tensors2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label1SynthImg_tensors], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label2SynthImg_tensors], 0)
+        # print(image_tensors1.shape)
+        # print(label1SynthImg_tensors.shape)
+        return image_tensors1, image_tensors2, labels1, labels2, label1SynthImg_tensors, label2SynthImg_tensors
+
+
+
+
+class AlignPairImgCollate_Norm(object):
+
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+
+    def __call__(self, batch):
+        batch = filter(lambda x: x is not None, batch)
+        images1, images2, labels1, labels2, label1SynthImgs, label2SynthImgs = zip(*batch)
+
+        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+            resized_max_w = self.imgW
+            input_channel = 3 if images1[0].mode == 'RGB' else 1
+            transform = NormalizePAD_Mean((input_channel, self.imgH, resized_max_w))
+
+            input_channel_synth = 3 if label1SynthImgs[0].mode == 'RGB' else 1
+            transform_synth = NormalizePAD((input_channel_synth, self.imgH, resized_max_w))
+
+            resized_images1 = []
+            resized_images2 = []
+            resized_label1SynthImgs = []
+            resized_label2SynthImgs = []
+            
+            cntr=0
+            for image1 in images1:
+                image2=images2[cntr]
+                label1SynthImg=label1SynthImgs[cntr]
+                label2SynthImg=label2SynthImgs[cntr]
+                
+
+                w, h = image1.size
+                ratio = w / float(h)
+                if math.ceil(self.imgH * ratio) > self.imgW:
+                    resized_w = self.imgW
+                else:
+                    resized_w = math.ceil(self.imgH * ratio)
+
+                resized_image1 = image1.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images1.append(transform(resized_image1))
+                
+                #resizing image2 w.r.t image1 dimensions
+                resized_image2 = image2.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images2.append(transform(resized_image2))
+
+                resized_label1SynthImg = label1SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label1SynthImgs.append(transform_synth(resized_label1SynthImg))
+
+                resized_label2SynthImg = label2SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label2SynthImgs.append(transform_synth(resized_label2SynthImg))
+                # resized_image.save('./image_test/%d_test.jpg' % w)
+                cntr+=1
+
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in resized_images1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in resized_images2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label1SynthImgs], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label2SynthImgs], 0)
+
+        else:
+            
+            transform = ResizeNormalize_Mean((self.imgW, self.imgH))
+            transform_synth = ResizeNormalize((self.imgW, self.imgH))
+            
+            image_tensors1 = [transform(image) for image in images1]
+            image_tensors2 = [transform(image) for image in images2]
+            
+            label1SynthImg_tensors = [transform_synth(image) for image in label1SynthImgs]
+            label2SynthImg_tensors = [transform_synth(image) for image in label2SynthImgs]
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in image_tensors1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in image_tensors2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label1SynthImg_tensors], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label2SynthImg_tensors], 0)
+        # print(image_tensors1.shape)
+        # print(label1SynthImg_tensors.shape)
+        return image_tensors1, image_tensors2, labels1, labels2, label1SynthImg_tensors, label2SynthImg_tensors
+
 class AlignPairImgCollateVarSize(object):
 
     def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
@@ -1206,12 +1469,98 @@ class AlignPairImgCollateVarSize(object):
         # print(label1SynthImg_tensors.shape)
         return image_tensors1, image_tensors2, labels1, labels2, label1SynthImg_tensors, label2SynthImg_tensors
 
+
+class AlignPairImgCollate_Test(object):
+
+    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False):
+        self.imgH = imgH
+        self.imgW = imgW
+        self.keep_ratio_with_pad = keep_ratio_with_pad
+
+    def __call__(self, batch):
+        batch = filter(lambda x: x is not None, batch)
+        images1, images2, labels1, labels2, label1SynthImgs, label2SynthImgs = zip(*batch)
+        images1_shape = []
+        images2_shape = []
+        
+        for image in images1:
+            images1_shape.append(image.size)
+        for image in images2:
+            images2_shape.append(image.size)
+
+        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
+            resized_max_w = self.imgW
+            input_channel = 3 if images1[0].mode == 'RGB' else 1
+            transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
+
+            input_channel_synth = 3 if label1SynthImgs[0].mode == 'RGB' else 1
+            transform_synth = NormalizePAD((input_channel_synth, self.imgH, resized_max_w))
+
+            resized_images1 = []
+            resized_images2 = []
+            resized_label1SynthImgs = []
+            resized_label2SynthImgs = []
+            
+            cntr=0
+            for image1 in images1:
+                image2=images2[cntr]
+                label1SynthImg=label1SynthImgs[cntr]
+                label2SynthImg=label2SynthImgs[cntr]
+                
+
+                w, h = image1.size
+                ratio = w / float(h)
+                if math.ceil(self.imgH * ratio) > self.imgW:
+                    resized_w = self.imgW
+                else:
+                    resized_w = math.ceil(self.imgH * ratio)
+
+                resized_image1 = image1.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images1.append(transform(resized_image1))
+                
+                #resizing image2 w.r.t image1 dimensions
+                resized_image2 = image2.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_images2.append(transform(resized_image2))
+
+                resized_label1SynthImg = label1SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label1SynthImgs.append(transform_synth(resized_label1SynthImg))
+
+                resized_label2SynthImg = label2SynthImg.resize((resized_w, self.imgH), Image.BICUBIC)
+                resized_label2SynthImgs.append(transform_synth(resized_label2SynthImg))
+                # resized_image.save('./image_test/%d_test.jpg' % w)
+                cntr+=1
+
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in resized_images1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in resized_images2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label1SynthImgs], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in resized_label2SynthImgs], 0)
+
+        else:
+            transform = ResizeNormalize((self.imgW, self.imgH))
+            image_tensors1 = [transform(image) for image in images1]
+            image_tensors2 = [transform(image) for image in images2]
+
+            
+            label1SynthImg_tensors = [transform(image) for image in label1SynthImgs]
+            label2SynthImg_tensors = [transform(image) for image in label2SynthImgs]
+            image_tensors1 = torch.cat([t.unsqueeze(0) for t in image_tensors1], 0)
+            image_tensors2 = torch.cat([t.unsqueeze(0) for t in image_tensors2], 0)
+            label1SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label1SynthImg_tensors], 0)
+            label2SynthImg_tensors = torch.cat([t.unsqueeze(0) for t in label2SynthImg_tensors], 0)
+        # print(image_tensors1.shape)
+        # print(label1SynthImg_tensors.shape)
+        return image_tensors1, image_tensors2, labels1, labels2, label1SynthImg_tensors, label2SynthImg_tensors, images1_shape, images2_shape
+
+
+
+
 def tensor2im(image_tensor, imtype=np.uint8):
     image_numpy = image_tensor.cpu().float().numpy()
     if image_numpy.shape[0] == 1:
         image_numpy = np.tile(image_numpy, (3, 1, 1))
     image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0
     return image_numpy.astype(imtype)
+
 
 
 def save_image(image_numpy, image_path):
@@ -1382,6 +1731,7 @@ class text_gen_synth(Dataset):
         label = self.idx2Word[self.words[index]]  
 
         return label, self.synthGen.synthesizeWordImage(label, 0)
+
 
 class AlignSynthTextCollate(object):
 
@@ -1559,3 +1909,4 @@ class fontTextDataset(Dataset):
                 img = self.transform(img)
         
         return img, torch.from_numpy(np.int64([self.fontIdx[index]]))
+
